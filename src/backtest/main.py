@@ -8,8 +8,16 @@ from backtest.config import DEFAULT_WORKBOOK, resolve_sample_csv
 from backtest.data import load_option_dataset
 from backtest.replay import CsvReplayFeed, register_token_tickers
 from backtest.sessions import build_backtest_sessions
+from backtest.spot_data import load_spot_series
 from vol_dashboard.market.spot import SpotStore
 from vol_dashboard.ui.app import VolDashboardApp
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("--refresh-ms must be greater than zero.")
+    return parsed
 
 
 def main() -> None:
@@ -17,12 +25,32 @@ def main() -> None:
     parser.add_argument("--date", help="Sample file date, e.g. 09042026 or 09-04-2026")
     parser.add_argument("--csv", type=Path, default=None)
     parser.add_argument("--workbook", type=Path, default=DEFAULT_WORKBOOK)
+    parser.add_argument(
+        "--refresh-ms",
+        type=positive_int,
+        default=None,
+        help="Milliseconds between replay slices, e.g. 100 for faster playback.",
+    )
     args = parser.parse_args()
 
     csv_path = resolve_sample_csv(args.date, args.csv)
     dataset = load_option_dataset(csv_path)
+    spot_points = []
+    spot_source = None
+    try:
+        spot_series = load_spot_series(dataset.trade_date)
+        spot_points = spot_series.points
+        spot_source = str(spot_series.source_path)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"Spot data unavailable: {exc}")
+
     current_time = lambda: replay.now()
-    sessions = build_backtest_sessions(dataset, args.workbook, current_time)
+    sessions = build_backtest_sessions(
+        dataset,
+        args.workbook,
+        current_time,
+        refresh_ms=args.refresh_ms,
+    )
     replay = CsvReplayFeed(dataset, sessions)
     register_token_tickers(sessions, dataset)
 
@@ -33,6 +61,10 @@ def main() -> None:
     )
     for session in sessions:
         print(f"  {session.spec.tab_name}: {len(session.chain)} strikes")
+    print(
+        f"Replay refresh: "
+        f"{min(session.config.market.refresh_ms for session in sessions)} ms"
+    )
 
     root = tk.Tk()
     root.title("Backtest Vol Dashboard")
@@ -40,6 +72,8 @@ def main() -> None:
         root,
         sessions,
         spot_store=SpotStore(),
+        spot_points=spot_points,
+        spot_source=spot_source,
         before_refresh=replay.advance,
         clock=replay.now,
     )

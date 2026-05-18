@@ -1,0 +1,3 @@
+.backtest_data_cache/
+__pycache__/
+*.py[cod]

@@ -23,10 +23,17 @@ def build_backtest_sessions(
     dataset: OptionDataset,
     workbook_path: Path,
     current_time: Callable[[], datetime],
+    refresh_ms: int | None = None,
 ) -> list[ExpirySession]:
     sessions = []
     for expiry in dataset.expiries:
-        config = build_backtest_config(workbook_path, expiry, dataset.trade_date)
+        config = build_backtest_config(
+            dataset,
+            workbook_path,
+            expiry,
+            dataset.trade_date,
+            refresh_ms,
+        )
         instruments = instruments_for_expiry(dataset, expiry)
         chain, token_to_strike, tokens = build_option_chain(instruments, config.strikes)
         if not tokens:
@@ -47,7 +54,13 @@ def build_backtest_sessions(
     return sessions
 
 
-def build_backtest_config(workbook_path: Path, expiry: date, trade_date: date):
+def build_backtest_config(
+    dataset: OptionDataset,
+    workbook_path: Path,
+    expiry: date,
+    trade_date: date,
+    refresh_ms: int | None = None,
+):
     previous = os.environ.get("HOLIDAYS_FILE")
     os.environ["HOLIDAYS_FILE"] = str(workbook_path)
     try:
@@ -77,7 +90,13 @@ def build_backtest_config(workbook_path: Path, expiry: date, trade_date: date):
     return replace(
         config,
         api=ApiConfig(api_key="", access_token=""),
-        market=replace(config.market, full_days=full_days, holidays_file=workbook_path),
+        market=replace(
+            config.market,
+            user_value=initial_user_value(dataset, expiry, config.market.user_value),
+            full_days=full_days,
+            holidays_file=workbook_path,
+            refresh_ms=refresh_ms or config.market.refresh_ms,
+        ),
         model=replace(
             config.model,
             initial_a=model_params["a"],
@@ -87,6 +106,27 @@ def build_backtest_config(workbook_path: Path, expiry: date, trade_date: date):
             initial_floorr=model_params["floorR"],
         ),
     )
+
+
+def initial_user_value(dataset: OptionDataset, expiry: date, fallback: int) -> int:
+    if os.getenv("USER_VALUE"):
+        return fallback
+
+    expiry_frame = dataset.frame[dataset.frame["expiry"] == expiry]
+    if expiry_frame.empty:
+        return fallback
+
+    first_timestamp = expiry_frame["timestamp"].min()
+    first_slice = expiry_frame[expiry_frame["timestamp"] == first_timestamp]
+    ce_strikes = set(first_slice[first_slice["option_type"] == "CE"]["strike"])
+    pe_strikes = set(first_slice[first_slice["option_type"] == "PE"]["strike"])
+    strikes = sorted(ce_strikes & pe_strikes)
+    if not strikes:
+        strikes = sorted(expiry_frame["strike"].unique())
+    if not strikes:
+        return fallback
+
+    return int(strikes[len(strikes) // 2])
 
 
 def instruments_for_expiry(dataset: OptionDataset, expiry: date) -> pd.DataFrame:

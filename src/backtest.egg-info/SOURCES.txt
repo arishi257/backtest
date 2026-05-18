@@ -5,6 +5,7 @@ src/backtest/__main__.py
 src/backtest/config.py
 src/backtest/data.py
 src/backtest/main.py
+src/backtest/portfolio.py
 src/backtest/replay.py
 src/backtest/runner.py
 src/backtest/sessions.py

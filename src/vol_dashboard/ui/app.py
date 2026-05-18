@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import math
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -41,6 +42,8 @@ class VolDashboardApp:
         root: tk.Tk,
         sessions: list[ExpirySession],
         spot_store: SpotStore | None = None,
+        spot_points: list[tuple[datetime, float]] | None = None,
+        spot_source: str | None = None,
         before_refresh: Callable[[], bool] | None = None,
         clock: Callable[[], datetime] | None = None,
         auto_schedule: bool = True,
@@ -48,6 +51,8 @@ class VolDashboardApp:
         self.root = root
         self.sessions = sessions
         self.spot_store = spot_store
+        self.spot_points = spot_points or []
+        self.spot_source = spot_source
         self.before_refresh = before_refresh
         self.clock = clock or (lambda: datetime.now(ZoneInfo("Asia/Kolkata")))
         self.auto_schedule = auto_schedule
@@ -91,6 +96,14 @@ class VolDashboardApp:
             frame = tk.Frame(self.notebook)
             self.notebook.add(frame, text=session.spec.tab_name)
             self.tabs.append(ExpiryTab(frame, session, self.locked_skews))
+
+        spot_time_frame = tk.Frame(self.notebook)
+        self.notebook.add(spot_time_frame, text="Spot vs Time")
+        self.spot_time_tab = SpotTimeTab(
+            spot_time_frame,
+            self.spot_points,
+            self.spot_source,
+        )
 
         portfolio_frame = tk.Frame(self.notebook)
         self.notebook.add(portfolio_frame, text="Portfolio Risk")
@@ -430,7 +443,36 @@ class VolDashboardApp:
                 roll_by_tab.get(tab.session.spec.tab_name),
             )
 
-        self._refresh_portfolio_risk()
+        nearest_session = self._nearest_session()
+        nearest_result = (
+            self.latest_results.get(nearest_session.spec.tab_name)
+            if nearest_session is not None
+            else None
+        )
+        universal_mid = nearest_result.universal_mid if nearest_result is not None else None
+        calendar_days = (
+            nearest_session.config.market.calendar_days
+            if nearest_session is not None
+            else None
+        )
+        intraday_var = (
+            nearest_session.config.market.intraday_var
+            if nearest_session is not None
+            else None
+        )
+        self.spot_time_tab.record_universal_mid(snapshot_timestamp, universal_mid)
+        full_day_spot_vol, full_day_mid_vol = self.spot_time_tab.full_day_vols(
+            snapshot_timestamp,
+            calendar_days,
+            intraday_var,
+        )
+        self._refresh_portfolio_risk(full_day_spot_vol, full_day_mid_vol)
+        self.spot_time_tab.render(
+            snapshot_timestamp,
+            universal_mid,
+            calendar_days,
+            intraday_var,
+        )
         self._render_spot_rows(spot_by_underlying)
         self._render_skew_lock_table()
         self._render_snapshot_comparison()
@@ -439,7 +481,11 @@ class VolDashboardApp:
             refresh_ms = min(session.config.market.refresh_ms for session in self.sessions)
             self.root.after(refresh_ms, self.refresh)
 
-    def _refresh_portfolio_risk(self) -> None:
+    def _refresh_portfolio_risk(
+        self,
+        full_day_spot_vol: float | None,
+        full_day_mid_vol: float | None,
+    ) -> None:
         if not self.sessions:
             return
 
@@ -466,7 +512,14 @@ class VolDashboardApp:
             nearest_session.config.market.funding_rate,
             nearest_session.config.market.brokerage_rate,
             self._delta_hedge_threshold(),
+            full_day_spot_vol,
+            full_day_mid_vol,
         )
+
+    def _nearest_session(self) -> ExpirySession | None:
+        if not self.sessions:
+            return None
+        return sorted(self.sessions, key=lambda item: item.spec.expiry)[0]
 
     def _delta_hedge_threshold(self) -> float:
         return self.committed_delta_hedge_threshold
@@ -1022,6 +1075,252 @@ class ExpiryTab:
         self.cash_canvas.draw()
 
 
+class SpotTimeTab:
+    def __init__(
+        self,
+        parent: tk.Frame,
+        points: list[tuple[datetime, float]],
+        source: str | None = None,
+    ) -> None:
+        self.parent = parent
+        self.points = points
+        self.source = source
+        self.metric_vars = {
+            "Replay time": tk.StringVar(value="--"),
+            "Spot rows": tk.StringVar(value=str(len(points))),
+            "Current close": tk.StringVar(value="--"),
+            "Universal mid": tk.StringVar(value="--"),
+            "Basis": tk.StringVar(value="--"),
+            "Vol Spot": tk.StringVar(value="--"),
+            "Vol Universal Mid": tk.StringVar(value="--"),
+            "Source": tk.StringVar(value=source or "--"),
+        }
+        self.universal_mid_points: list[tuple[datetime, float]] = []
+        self.fig: Figure
+        self.ax = None
+        self.canvas = None
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        metrics = tk.LabelFrame(self.parent, text="Spot vs Time Metrics")
+        metrics.pack(fill="x", padx=8, pady=6)
+        for row_index, (name, value_var) in enumerate(self.metric_vars.items()):
+            tk.Label(
+                metrics,
+                text=name,
+                anchor="w",
+                width=18,
+                padx=6,
+                pady=2,
+                font=("Arial", 10, "bold"),
+            ).grid(row=row_index, column=0, sticky="w")
+            tk.Label(
+                metrics,
+                textvariable=value_var,
+                anchor="w",
+                padx=6,
+                pady=2,
+                wraplength=1100,
+            ).grid(row=row_index, column=1, sticky="ew")
+        metrics.grid_columnconfigure(1, weight=1)
+        self.fig, self.ax, self.canvas = build_plot(self.parent)
+
+    def render(
+        self,
+        current_timestamp: datetime,
+        universal_mid: float | None = None,
+        calendar_days: float | None = None,
+        intraday_var: float | None = None,
+    ) -> None:
+        if self.ax is None or self.canvas is None:
+            return
+
+        self.record_universal_mid(current_timestamp, universal_mid)
+
+        self.ax.clear()
+        apply_axis_bg(self.ax, None)
+        if not self.points and not self.universal_mid_points:
+            self.ax.set_title("Spot Close vs Time")
+            self.ax.set_xlabel("Time IST")
+            self.ax.set_ylabel("Price")
+            self.ax.grid(True)
+            self._set_metrics(
+                current_timestamp=current_timestamp,
+                current_close=None,
+                current_mid=None,
+                basis=None,
+                vol_spot=None,
+                vol_mid=None,
+                spot_rows=0,
+                source="No spot or universal mid data loaded for this replay date",
+            )
+            self.canvas.draw()
+            return
+
+        current_close, elapsed_spot_points = self._render_spot_series(current_timestamp)
+        current_mid = self._render_universal_mid_series()
+        vol_spot = annualized_running_vol(
+            elapsed_spot_points,
+            calendar_days,
+            intraday_var,
+        )
+        vol_mid = annualized_running_vol(
+            self.universal_mid_points,
+            calendar_days,
+            intraday_var,
+        )
+        basis = (
+            universal_mid - current_close
+            if universal_mid is not None and current_close is not None
+            else None
+        )
+
+        self.ax.axvline(current_timestamp, color="#d32f2f", linestyle="--", linewidth=1)
+        self.ax.set_title("NIFTY Spot Close and Universal Mid vs Time")
+        self.ax.set_xlabel("Time IST")
+        self.ax.set_ylabel("Price")
+        self.ax.grid(True)
+        self.ax.legend()
+        self.fig.autofmt_xdate()
+        self._set_metrics(
+            current_timestamp=current_timestamp,
+            current_close=current_close,
+            current_mid=current_mid,
+            basis=basis,
+            vol_spot=vol_spot,
+            vol_mid=vol_mid,
+            spot_rows=len(self.points),
+            source=self.source,
+        )
+        self.canvas.draw()
+
+    def _set_metrics(
+        self,
+        current_timestamp: datetime,
+        current_close: float | None,
+        current_mid: float | None,
+        basis: float | None,
+        vol_spot: float | None,
+        vol_mid: float | None,
+        spot_rows: int,
+        source: str | None,
+    ) -> None:
+        self.metric_vars["Replay time"].set(format_ist_timestamp(current_timestamp))
+        self.metric_vars["Spot rows"].set(str(spot_rows))
+        self.metric_vars["Current close"].set(
+            format_cash(current_close) if current_close is not None else "--"
+        )
+        self.metric_vars["Universal mid"].set(
+            format_cash(current_mid) if current_mid is not None else "--"
+        )
+        self.metric_vars["Basis"].set(
+            format_optional_number(basis) if basis is not None else "--"
+        )
+        self.metric_vars["Vol Spot"].set(
+            format_percent(vol_spot) if vol_spot is not None else "--"
+        )
+        self.metric_vars["Vol Universal Mid"].set(
+            format_percent(vol_mid) if vol_mid is not None else "--"
+        )
+        self.metric_vars["Source"].set(source or "--")
+
+    def record_universal_mid(
+        self,
+        current_timestamp: datetime,
+        universal_mid: float | None,
+    ) -> None:
+        if universal_mid is None:
+            return
+        if (
+            not self.universal_mid_points
+            or self.universal_mid_points[-1][0] != current_timestamp
+        ):
+            self.universal_mid_points.append((current_timestamp, universal_mid))
+
+    def full_day_vols(
+        self,
+        current_timestamp: datetime,
+        calendar_days: float | None,
+        intraday_var: float | None,
+    ) -> tuple[float | None, float | None]:
+        return (
+            annualized_available_vol(
+                self.elapsed_spot_points(current_timestamp),
+                calendar_days,
+                intraday_var,
+            ),
+            annualized_available_vol(
+                self.universal_mid_points,
+                calendar_days,
+                intraday_var,
+            ),
+        )
+
+    def elapsed_spot_points(
+        self,
+        current_timestamp: datetime,
+    ) -> list[tuple[datetime, float]]:
+        return [
+            (timestamp, close)
+            for timestamp, close in self.points
+            if timestamp <= current_timestamp
+        ]
+
+    def _render_spot_series(
+        self,
+        current_timestamp: datetime,
+    ) -> tuple[float | None, list[tuple[datetime, float]]]:
+        if not self.points:
+            return None, []
+
+        times = [timestamp for timestamp, _ in self.points]
+        closes = [close for _, close in self.points]
+        elapsed_points = self.elapsed_spot_points(current_timestamp)
+        self.ax.plot(times, closes, color="#b8b8b8", linewidth=1.1, label="Spot full day")
+        if not elapsed_points:
+            return None, []
+
+        elapsed_times = [timestamp for timestamp, _ in elapsed_points]
+        elapsed_closes = [close for _, close in elapsed_points]
+        self.ax.plot(
+            elapsed_times,
+            elapsed_closes,
+            color="#1769aa",
+            linewidth=1.8,
+            label="Spot close",
+        )
+        self.ax.scatter(
+            [elapsed_times[-1]],
+            [elapsed_closes[-1]],
+            color="#1769aa",
+            s=24,
+            zorder=3,
+        )
+        return elapsed_closes[-1], elapsed_points
+
+    def _render_universal_mid_series(self) -> float | None:
+        if not self.universal_mid_points:
+            return None
+
+        times = [timestamp for timestamp, _ in self.universal_mid_points]
+        mids = [mid for _, mid in self.universal_mid_points]
+        self.ax.plot(
+            times,
+            mids,
+            color="#d32f2f",
+            linewidth=1.8,
+            label="Universal mid",
+        )
+        self.ax.scatter(
+            [times[-1]],
+            [mids[-1]],
+            color="#d32f2f",
+            s=24,
+            zorder=3,
+        )
+        return mids[-1]
+
+
 class PortfolioRiskTab:
     def __init__(self, parent: tk.Frame, hedges_tab: "HedgesTab | None" = None) -> None:
         self.parent = parent
@@ -1032,6 +1331,9 @@ class PortfolioRiskTab:
         self.total_pnl_var = tk.StringVar(value="Total PnL: ")
         self.final_delta_var = tk.StringVar(value="Final Delta: ")
         self.hedge_status_var = tk.StringVar(value="Hedge starts at 09:20")
+        self.full_day_vol_var = tk.StringVar(
+            value="Full-Day Vol Spot: -- | Full-Day Vol Universal Mid: --"
+        )
         self.cell_labels: dict[tuple[int, int], tk.Label] = {}
         self.section_labels: dict[int, tk.Label] = {}
         self.rendered_body_rows = 0
@@ -1117,6 +1419,7 @@ class PortfolioRiskTab:
             self.total_pnl_var,
             self.final_delta_var,
             self.hedge_status_var,
+            self.full_day_vol_var,
         ):
             tk.Label(
                 pnl_frame,
@@ -1165,12 +1468,18 @@ class PortfolioRiskTab:
         funding_rate: float,
         brokerage_rate: float,
         hedge_threshold: float,
+        full_day_spot_vol: float | None,
+        full_day_mid_vol: float | None,
     ) -> None:
         time_text = format_ist_timestamp(timestamp)
         self.status_var.set(
             f"{expiry_name} | Slice IST: {time_text} | "
             f"Universal Mid: {format_number(result.universal_mid, 2)} | "
             f"Positions: {len(positions)}"
+        )
+        self.full_day_vol_var.set(
+            f"Full-Day Vol Spot: {format_percent_or_dash(full_day_spot_vol)} | "
+            f"Full-Day Vol Universal Mid: {format_percent_or_dash(full_day_mid_vol)}"
         )
         required_body_rows = len(risk_rows) + 2
         self._ensure_body_rows(required_body_rows)
@@ -1869,6 +2178,62 @@ def is_hedge_start_time(timestamp: datetime) -> bool:
     return (timestamp.hour, timestamp.minute) >= (9, 20)
 
 
+def annualized_running_vol(
+    points: list[tuple[datetime, float]],
+    calendar_days: float | None,
+    intraday_var: float | None,
+    window: int = 10,
+) -> float | None:
+    return annualized_vol(points, calendar_days, intraday_var, window)
+
+
+def annualized_available_vol(
+    points: list[tuple[datetime, float]],
+    calendar_days: float | None,
+    intraday_var: float | None,
+) -> float | None:
+    return annualized_vol(points, calendar_days, intraday_var, None)
+
+
+def annualized_vol(
+    points: list[tuple[datetime, float]],
+    calendar_days: float | None,
+    intraday_var: float | None,
+    window: int | None,
+) -> float | None:
+    if calendar_days is None or intraday_var in (None, 0):
+        return None
+
+    variances = one_minute_variances(points)
+    if window is not None:
+        if len(variances) < window:
+            return None
+        variances = variances[-window:]
+    if not variances:
+        return None
+
+    average_variance = sum(variances) / len(variances)
+    annual_variance = average_variance * 375 * calendar_days / intraday_var
+    if annual_variance < 0:
+        return None
+    return math.sqrt(annual_variance)
+
+
+def one_minute_variances(points: list[tuple[datetime, float]]) -> list[float]:
+    variances = []
+    for (previous_timestamp, previous_value), (timestamp, value) in zip(
+        points,
+        points[1:],
+    ):
+        if (timestamp - previous_timestamp).total_seconds() != 60:
+            continue
+        if previous_value <= 0 or value <= 0:
+            continue
+        log_return = math.log(value / previous_value)
+        variances.append(log_return * log_return)
+    return variances
+
+
 def nearest_result_strike(result: AnalyticsResult, value: float) -> int:
     strikes = [row.strike for row in result.rows]
     return min(strikes, key=lambda strike: (abs(strike - value), strike))
@@ -2066,6 +2431,12 @@ def format_percent(value) -> str:
     if value is None or value == "":
         return ""
     return f"{value * 100:.2f}%"
+
+
+def format_percent_or_dash(value) -> str:
+    if value is None or value == "":
+        return "--"
+    return format_percent(value)
 
 
 def format_vol(value) -> str:
