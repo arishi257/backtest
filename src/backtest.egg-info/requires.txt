@@ -1,0 +1,5 @@
+kiteconnect
+matplotlib
+numpy
+pandas
+scipy

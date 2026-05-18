@@ -1,0 +1,23 @@
+[project]
+name = "backtest"
+version = "0.1.0"
+description = "Offline NIFTY option replay feed for the volatility dashboard"
+requires-python = ">=3.11"
+dependencies = [
+    "kiteconnect",
+    "matplotlib",
+    "numpy",
+    "pandas",
+    "scipy",
+]
+
+[project.scripts]
+backtest-dashboard = "backtest.main:main"
+backtest-runner = "backtest.runner:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

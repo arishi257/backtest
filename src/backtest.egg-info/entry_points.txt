@@ -1,0 +1,3 @@
+[console_scripts]
+backtest-dashboard = backtest.main:main
+backtest-runner = backtest.runner:main

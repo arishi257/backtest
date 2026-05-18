@@ -1,0 +1,23 @@
+[project]
+name = "vol-dashboard"
+version = "0.1.0"
+description = "Multi-expiry NIFTY/SENSEX volatility dashboard"
+requires-python = ">=3.11"
+dependencies = [
+    "kiteconnect",
+    "matplotlib",
+    "numpy",
+    "pandas",
+    "scipy",
+]
+
+[project.scripts]
+vol-dashboard = "vol_dashboard.main:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
