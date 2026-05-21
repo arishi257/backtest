@@ -9,9 +9,8 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from backtest.config import UNDERLYING
 from backtest.data import OptionDataset
-from fit_sensex.config import ApiConfig, build_app_config
+from fit_sensex.config import ApiConfig, StrikeConfig, build_app_config
 from fit_sensex.market.instruments import build_option_chain
 from fit_sensex.market.kite_stream import MarketDataStore
 from fit_sensex.services.analytics import AnalyticsEngine
@@ -41,7 +40,7 @@ def build_backtest_sessions(
         store = MarketDataStore(chain, token_to_strike)
         sessions.append(
             ExpirySession(
-                spec=ExpirySpec(underlying=UNDERLYING, expiry=expiry),
+                spec=ExpirySpec(underlying=dataset.underlying, expiry=expiry),
                 config=config,
                 chain=chain,
                 store=store,
@@ -50,7 +49,7 @@ def build_backtest_sessions(
             )
         )
     if not sessions:
-        raise ValueError("No NIFTY option sessions could be built from the CSV.")
+        raise ValueError(f"No {dataset.underlying} option sessions could be built from the CSV.")
     return sessions
 
 
@@ -64,7 +63,7 @@ def build_backtest_config(
     previous = os.environ.get("HOLIDAYS_FILE")
     os.environ["HOLIDAYS_FILE"] = str(workbook_path)
     try:
-        config = build_app_config(UNDERLYING)
+        config = build_app_config(dataset.underlying)
     finally:
         if previous is None:
             os.environ.pop("HOLIDAYS_FILE", None)
@@ -72,12 +71,12 @@ def build_backtest_config(
             os.environ["HOLIDAYS_FILE"] = previous
 
     try:
-        full_days = load_full_days_for_expiry(workbook_path, expiry, UNDERLYING)
+        full_days = load_full_days_for_expiry(workbook_path, expiry, dataset.underlying)
     except (FileNotFoundError, ValueError):
         full_days = business_days_until_expiry(trade_date, expiry)
 
     try:
-        model_params = load_model_params(workbook_path, UNDERLYING)
+        model_params = load_model_params(workbook_path, dataset.underlying)
     except (FileNotFoundError, ValueError):
         model_params = {
             "a": config.model.initial_a,
@@ -87,12 +86,16 @@ def build_backtest_config(
             "floorR": config.model.initial_floorr,
         }
 
+    user_value = initial_user_value(dataset, expiry, config.market.user_value)
+    dynamic_strikes = dynamic_strike_config(user_value, config.strikes.gap)
+
     return replace(
         config,
         api=ApiConfig(api_key="", access_token=""),
+        strikes=dynamic_strikes,
         market=replace(
             config.market,
-            user_value=initial_user_value(dataset, expiry, config.market.user_value),
+            user_value=user_value,
             full_days=full_days,
             holidays_file=workbook_path,
             refresh_ms=refresh_ms or config.market.refresh_ms,
@@ -129,13 +132,19 @@ def initial_user_value(dataset: OptionDataset, expiry: date, fallback: int) -> i
     return int(strikes[len(strikes) // 2])
 
 
+def dynamic_strike_config(user_value: int, gap: int, width: int = 10000) -> StrikeConfig:
+    low = (user_value - width) // gap * gap
+    high = ((user_value + width + gap - 1) // gap) * gap
+    return StrikeConfig(low=max(0, int(low)), high=int(high), gap=gap)
+
+
 def instruments_for_expiry(dataset: OptionDataset, expiry: date) -> pd.DataFrame:
     rows = dataset.frame[dataset.frame["expiry"] == expiry][
         ["ticker", "expiry", "strike", "option_type"]
     ].drop_duplicates()
     rows = rows.sort_values(["strike", "option_type", "ticker"]).reset_index(drop=True)
     rows["instrument_token"] = rows.index + token_base(expiry)
-    rows["name"] = UNDERLYING
+    rows["name"] = dataset.underlying
     rows["tradingsymbol"] = rows["ticker"].str.removesuffix(".NFO")
     rows["instrument_type"] = rows["option_type"]
     return rows[

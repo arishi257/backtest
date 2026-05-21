@@ -1,3 +1,4 @@
 .backtest_data_cache/
+processed_data/
 __pycache__/
 *.py[cod]

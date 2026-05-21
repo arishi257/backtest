@@ -13,7 +13,9 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
 from vol_dashboard import compat  # noqa: F401
+from backtest.config import DEFAULT_PROCESSED_OUTPUT_DIR
 from backtest.portfolio import SamplePortfolioRisk, build_sample_portfolio
+from backtest.processed_data import ProcessedDataWriter
 from fit_sensex.models import AnalyticsResult
 from fit_sensex.pricing.black_scholes import (
     black_scholes_delta,
@@ -50,6 +52,7 @@ class VolDashboardApp:
         spot_store: SpotStore | None = None,
         spot_points: list[tuple[datetime, float]] | None = None,
         spot_source: str | None = None,
+        processed_output_dir: Path = DEFAULT_PROCESSED_OUTPUT_DIR,
         before_refresh: Callable[[], bool] | None = None,
         clock: Callable[[], datetime] | None = None,
         auto_schedule: bool = True,
@@ -71,6 +74,10 @@ class VolDashboardApp:
         self.current_skew_labels: dict[str, tk.Label] = {}
         self.locked_skew_labels: dict[str, tk.Label] = {}
         self.snapshot_writer = SnapshotWriter(SNAPSHOT_DIR)
+        self.processed_writer = ProcessedDataWriter(
+            processed_output_dir,
+            sessions,
+        )
         self.slice_time_var = tk.StringVar(value="Loaded Slice IST: --")
         self.delta_hedge_threshold_var = tk.StringVar(value="1.3")
         self.committed_delta_hedge_threshold = 1.3
@@ -112,6 +119,7 @@ class VolDashboardApp:
             spot_mid_frame,
             self.spot_points,
             self.spot_source,
+            self.sessions[0].spec.underlying if self.sessions else "NIFTY",
         )
         portfolio_frame = tk.Frame(self.notebook)
         self.notebook.add(portfolio_frame, text="Portfolio Risk")
@@ -479,6 +487,17 @@ class VolDashboardApp:
             intraday_var,
         )
         self._refresh_portfolio_risk(full_day_spot_vol, full_day_mid_vol)
+        if nearest_session is not None and nearest_result is not None:
+            self.processed_writer.write(
+                snapshot_timestamp,
+                nearest_session,
+                nearest_result,
+                self.spot_points,
+                self.spot_time_tab.universal_mid_points,
+                self.portfolio_tab.last_total_pnl,
+                self.portfolio_tab.last_gamma_l,
+                self.frozen_iv_tab.last_total_pnl,
+            )
         self.spot_time_tab.render(
             snapshot_timestamp,
             universal_mid,
@@ -512,6 +531,18 @@ class VolDashboardApp:
             return
 
         if self.portfolio_risk is None:
+            if (
+                nearest_session.spec.underlying == "SENSEX"
+                and self.last_live_timestamp is not None
+                and not is_hedge_start_time(self.last_live_timestamp)
+            ):
+                self.portfolio_tab.set_status(
+                    "Waiting until 09:20 to create SENSEX portfolio"
+                )
+                self.frozen_iv_tab.set_status(
+                    "Waiting until 09:20 to freeze SENSEX portfolio"
+                )
+                return
             self.portfolio_risk = build_sample_portfolio(nearest_session, result)
             if self.portfolio_risk is None:
                 self.portfolio_tab.set_status("Waiting for enough strikes to build portfolio")
@@ -1106,11 +1137,13 @@ class SpotTimeTab:
         price_parent: tk.Frame,
         points: list[tuple[datetime, float]],
         source: str | None = None,
+        underlying: str = "NIFTY",
     ) -> None:
         self.parent = parent
         self.price_parent = price_parent
         self.points = points
         self.source = source
+        self.underlying = underlying
         self.metric_vars = {
             "Replay time": tk.StringVar(value="--"),
             "Spot rows": tk.StringVar(value=str(len(points))),
@@ -1133,7 +1166,12 @@ class SpotTimeTab:
         self.vol_fig: Figure
         self.vol_ax = None
         self.pnl_ax = None
-        self.price_tab = SpotUniversalMidTab(price_parent, points, self.universal_mid_points)
+        self.price_tab = SpotUniversalMidTab(
+            price_parent,
+            points,
+            self.universal_mid_points,
+            underlying,
+        )
         self.vol_canvas = None
         self.top_moves_tree = None
         self._build_ui()
@@ -1653,10 +1691,12 @@ class SpotUniversalMidTab:
         parent: tk.Frame,
         points: list[tuple[datetime, float]],
         universal_mid_points: list[tuple[datetime, float]],
+        underlying: str = "NIFTY",
     ) -> None:
         self.parent = parent
         self.points = points
         self.universal_mid_points = universal_mid_points
+        self.underlying = underlying
         self.fig: Figure
         self.ax = None
         self.canvas = None
@@ -1671,7 +1711,7 @@ class SpotUniversalMidTab:
         self._render_spot_series(current_timestamp)
         self._render_universal_mid_series()
         self.ax.axvline(current_timestamp, color="#d32f2f", linestyle="--", linewidth=1)
-        self.ax.set_title("NIFTY Spot Close and Universal Mid vs Time")
+        self.ax.set_title(f"{self.underlying} Spot Close and Universal Mid vs Time")
         self.ax.set_xlabel("Time IST")
         self.ax.set_ylabel("Price")
         self.ax.grid(True)
@@ -1754,6 +1794,7 @@ class PortfolioRiskTab:
         self.hedge_strike: int | None = None
         self.hedge_trades: list[dict[str, float | str]] = []
         self.cumulative_hedge_lots = 0.0
+        self.current_positions: list = []
         self.last_total_pnl: float | None = None
         self.last_gamma_l: float | None = None
         self.data_writer = PortfolioDataWriter(BACKTEST_OUTPUT_DIR)
@@ -1886,6 +1927,7 @@ class PortfolioRiskTab:
         full_day_spot_vol: float | None,
         full_day_mid_vol: float | None,
     ) -> None:
+        self.current_positions = positions
         time_text = format_ist_timestamp(timestamp)
         self.status_var.set(
             f"{expiry_name} | Slice IST: {time_text} | "
@@ -2308,11 +2350,12 @@ class PortfolioRiskTab:
         if prices is None:
             return None
         _, _, synth_mid = prices
+        multiplier = hedge_multiplier(self.current_positions)
         pnl = 0.0
         for trade in self.hedge_trades:
             pnl += float(trade["lots_change"]) * (
                 synth_mid - float(trade["trade_price"])
-            ) * 65 / 1000
+            ) * multiplier / 1000
         return pnl
 
     def _hedge_trade_rows(
@@ -2339,7 +2382,12 @@ class PortfolioRiskTab:
         for trade in self.hedge_trades:
             lots_change = float(trade["lots_change"])
             trade_price = float(trade["trade_price"])
-            pnl = lots_change * (synth_mid - trade_price) * 65 / 1000
+            pnl = (
+                lots_change
+                * (synth_mid - trade_price)
+                * hedge_multiplier(self.current_positions)
+                / 1000
+            )
             rows.append(
                 {
                     "timestamp": trade["timestamp"],
@@ -2973,6 +3021,13 @@ def hedge_prices(
         time=result.time,
     )
     return synth_bid, synth_ask, (synth_bid + synth_ask) / 2
+
+
+def hedge_multiplier(positions: list[PortfolioPosition]) -> float:
+    for position in positions:
+        if position.mult:
+            return float(position.mult)
+    return 65.0
 
 
 def calculate_atm_vol_skew(result: AnalyticsResult) -> float | None:

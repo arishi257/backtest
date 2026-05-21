@@ -10,8 +10,11 @@ from vol_dashboard.models import ExpirySession
 
 SHORT_LOTS = -20
 LONG_LOTS = 60
-MULTIPLIER = 65
 HEDGE_DISTANCE = 300
+SENSEX_SHORT_LOTS = -12
+SENSEX_SHORT_COUNT = 5
+SENSEX_LONG_LOTS = 60
+SENSEX_WING_DISTANCE = 900
 
 
 @dataclass
@@ -48,6 +51,15 @@ def build_sample_portfolio(
     session: ExpirySession,
     result: AnalyticsResult,
 ) -> SamplePortfolioRisk | None:
+    if session.spec.underlying == "SENSEX":
+        return build_sensex_portfolio(session, result)
+    return build_nifty_portfolio(session, result)
+
+
+def build_nifty_portfolio(
+    session: ExpirySession,
+    result: AnalyticsResult,
+) -> SamplePortfolioRisk | None:
     strikes = sorted(row.strike for row in result.rows if row_has_complete_risk(row))
     put_shorts = nearest_downside_strikes(strikes, result.universal_mid, 3)
     call_shorts = nearest_upside_strikes(strikes, result.universal_mid, 3)
@@ -67,6 +79,50 @@ def build_sample_portfolio(
         for strike in call_shorts
     )
     positions.append(build_position(session, maturity, long_call, "CE", LONG_LOTS))
+    positions.sort(key=lambda position: (position.strike, position.option_type))
+
+    return SamplePortfolioRisk(
+        session=session,
+        positions=positions,
+        risk_engine=StaticPortfolioRiskEngine(session.config.market),
+    )
+
+
+def build_sensex_portfolio(
+    session: ExpirySession,
+    result: AnalyticsResult,
+) -> SamplePortfolioRisk | None:
+    strikes = sorted(row.strike for row in result.rows if row_has_complete_risk(row))
+    put_otm = nearest_downside_strikes(
+        strikes,
+        result.universal_mid,
+        SENSEX_SHORT_COUNT,
+    )
+    call_otm = nearest_upside_strikes(
+        strikes,
+        result.universal_mid,
+        SENSEX_SHORT_COUNT,
+    )
+    if len(put_otm) < SENSEX_SHORT_COUNT or len(call_otm) < SENSEX_SHORT_COUNT:
+        return None
+
+    long_put = nearest_strike(strikes, min(put_otm) - SENSEX_WING_DISTANCE)
+    long_call = nearest_strike(strikes, max(call_otm) + SENSEX_WING_DISTANCE)
+    maturity = session.spec.expiry.strftime("%d-%b-%y")
+    positions = [
+        build_position(session, maturity, strike, "PE", SENSEX_SHORT_LOTS)
+        for strike in put_otm
+    ]
+    positions.extend(
+        build_position(session, maturity, strike, "CE", SENSEX_SHORT_LOTS)
+        for strike in call_otm
+    )
+    positions.append(
+        build_position(session, maturity, long_put, "PE", SENSEX_LONG_LOTS)
+    )
+    positions.append(
+        build_position(session, maturity, long_call, "CE", SENSEX_LONG_LOTS)
+    )
     positions.sort(key=lambda position: (position.strike, position.option_type))
 
     return SamplePortfolioRisk(
@@ -99,6 +155,7 @@ def build_position(
     option_type: str,
     lots: int,
 ) -> PortfolioPosition:
+    multiplier = multiplier_for(session.spec.underlying)
     return PortfolioPosition(
         book="options",
         lots=lots,
@@ -106,6 +163,10 @@ def build_position(
         maturity=maturity,
         strike=strike,
         option_type=option_type,
-        qty=lots * MULTIPLIER,
-        mult=MULTIPLIER,
+        qty=lots * multiplier,
+        mult=multiplier,
     )
+
+
+def multiplier_for(underlying: str) -> int:
+    return 20 if underlying.strip().upper() == "SENSEX" else 65
