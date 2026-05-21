@@ -15,9 +15,15 @@ from matplotlib.figure import Figure
 from vol_dashboard import compat  # noqa: F401
 from backtest.portfolio import SamplePortfolioRisk, build_sample_portfolio
 from fit_sensex.models import AnalyticsResult
-from fit_sensex.pricing.black_scholes import black_scholes_vega
+from fit_sensex.pricing.black_scholes import (
+    black_scholes_delta,
+    black_scholes_gamma,
+    black_scholes_price,
+    black_scholes_theta_price_change,
+    black_scholes_vega,
+)
 from fit_sensex.pricing.vol_curve import ParametricVolCurve
-from fit_sensex.services.risk import synthetic_prices
+from fit_sensex.services.risk import RiskRow, intrinsic_value_from_synthetic_mid, synthetic_prices
 from fit_sensex.ui.app import (
     row_numeric_values as risk_row_numeric_values,
     row_values as risk_row_values,
@@ -97,20 +103,25 @@ class VolDashboardApp:
             self.notebook.add(frame, text=session.spec.tab_name)
             self.tabs.append(ExpiryTab(frame, session, self.locked_skews))
 
+        spot_mid_frame = tk.Frame(self.notebook)
+        self.notebook.add(spot_mid_frame, text="Spot vs Universal Mid")
         spot_time_frame = tk.Frame(self.notebook)
         self.notebook.add(spot_time_frame, text="Spot vs Time")
         self.spot_time_tab = SpotTimeTab(
             spot_time_frame,
+            spot_mid_frame,
             self.spot_points,
             self.spot_source,
         )
-
         portfolio_frame = tk.Frame(self.notebook)
         self.notebook.add(portfolio_frame, text="Portfolio Risk")
+        frozen_iv_frame = tk.Frame(self.notebook)
+        self.notebook.add(frozen_iv_frame, text="Frozen IV Risk")
         hedges_frame = tk.Frame(self.notebook)
         self.notebook.add(hedges_frame, text="Hedges")
         self.hedges_tab = HedgesTab(hedges_frame)
         self.portfolio_tab = PortfolioRiskTab(portfolio_frame, self.hedges_tab)
+        self.frozen_iv_tab = FrozenIvPortfolioTab(frozen_iv_frame)
 
     def _build_overview(self, parent: tk.Frame) -> None:
         tk.Label(
@@ -450,6 +461,7 @@ class VolDashboardApp:
             else None
         )
         universal_mid = nearest_result.universal_mid if nearest_result is not None else None
+        atm_vol = nearest_result.atm_vol if nearest_result is not None else None
         calendar_days = (
             nearest_session.config.market.calendar_days
             if nearest_session is not None
@@ -472,6 +484,10 @@ class VolDashboardApp:
             universal_mid,
             calendar_days,
             intraday_var,
+            atm_vol,
+            self.portfolio_tab.last_total_pnl,
+            self.portfolio_tab.last_gamma_l,
+            self.frozen_iv_tab.last_total_pnl,
         )
         self._render_spot_rows(spot_by_underlying)
         self._render_skew_lock_table()
@@ -514,6 +530,14 @@ class VolDashboardApp:
             self._delta_hedge_threshold(),
             full_day_spot_vol,
             full_day_mid_vol,
+        )
+        self.frozen_iv_tab.render(
+            nearest_session,
+            result,
+            self.last_live_timestamp,
+            nearest_session.config.market.funding_rate,
+            nearest_session.config.market.brokerage_rate,
+            self._delta_hedge_threshold(),
         )
 
     def _nearest_session(self) -> ExpirySession | None:
@@ -1079,10 +1103,12 @@ class SpotTimeTab:
     def __init__(
         self,
         parent: tk.Frame,
+        price_parent: tk.Frame,
         points: list[tuple[datetime, float]],
         source: str | None = None,
     ) -> None:
         self.parent = parent
+        self.price_parent = price_parent
         self.points = points
         self.source = source
         self.metric_vars = {
@@ -1091,19 +1117,32 @@ class SpotTimeTab:
             "Current close": tk.StringVar(value="--"),
             "Universal mid": tk.StringVar(value="--"),
             "Basis": tk.StringVar(value="--"),
+            "ATM Vol": tk.StringVar(value="--"),
             "Vol Spot": tk.StringVar(value="--"),
             "Vol Universal Mid": tk.StringVar(value="--"),
+            "Total PnL": tk.StringVar(value="--"),
+            "Gamma Diff Total": tk.StringVar(value="--"),
+            "Frozen IV Total PnL": tk.StringVar(value="--"),
             "Source": tk.StringVar(value=source or "--"),
         }
         self.universal_mid_points: list[tuple[datetime, float]] = []
-        self.fig: Figure
-        self.ax = None
-        self.canvas = None
+        self.atm_vol_points: list[tuple[datetime, float]] = []
+        self.vol_mid_points: list[tuple[datetime, float]] = []
+        self.total_pnl_points: list[tuple[datetime, float]] = []
+        self.gamma_l_points: list[tuple[datetime, float]] = []
+        self.vol_fig: Figure
+        self.vol_ax = None
+        self.pnl_ax = None
+        self.price_tab = SpotUniversalMidTab(price_parent, points, self.universal_mid_points)
+        self.vol_canvas = None
+        self.top_moves_tree = None
         self._build_ui()
 
     def _build_ui(self) -> None:
-        metrics = tk.LabelFrame(self.parent, text="Spot vs Time Metrics")
-        metrics.pack(fill="x", padx=8, pady=6)
+        top_row = tk.Frame(self.parent)
+        top_row.pack(fill="x", padx=8, pady=6)
+        metrics = tk.LabelFrame(top_row, text="Spot vs Time Metrics")
+        metrics.pack(side="left", fill="x", expand=True)
         for row_index, (name, value_var) in enumerate(self.metric_vars.items()):
             tk.Label(
                 metrics,
@@ -1123,7 +1162,16 @@ class SpotTimeTab:
                 wraplength=1100,
             ).grid(row=row_index, column=1, sticky="ew")
         metrics.grid_columnconfigure(1, weight=1)
-        self.fig, self.ax, self.canvas = build_plot(self.parent)
+        moves_frame = tk.LabelFrame(top_row, text="Universal Mid Moves > 0.10%")
+        moves_frame.pack(side="right", fill="y", padx=(8, 0))
+        self._build_top_moves_panel(moves_frame)
+
+        body = tk.Frame(self.parent)
+        body.pack(fill="both", expand=True)
+        chart_frame = tk.Frame(body)
+        chart_frame.pack(fill="both", expand=True)
+        self.vol_fig, self.vol_ax, self.vol_canvas = build_plot(chart_frame)
+        self.pnl_ax = self.vol_ax.twinx()
 
     def render(
         self,
@@ -1131,34 +1179,52 @@ class SpotTimeTab:
         universal_mid: float | None = None,
         calendar_days: float | None = None,
         intraday_var: float | None = None,
+        atm_vol: float | None = None,
+        total_pnl: float | None = None,
+        gamma_l: float | None = None,
+        frozen_iv_total_pnl: float | None = None,
     ) -> None:
-        if self.ax is None or self.canvas is None:
+        if self.vol_ax is None or self.pnl_ax is None or self.vol_canvas is None:
             return
 
         self.record_universal_mid(current_timestamp, universal_mid)
+        self._record_metric_point(self.atm_vol_points, current_timestamp, atm_vol)
+        self._record_metric_point(self.total_pnl_points, current_timestamp, total_pnl)
+        self._record_metric_point(self.gamma_l_points, current_timestamp, gamma_l)
 
-        self.ax.clear()
-        apply_axis_bg(self.ax, None)
+        self.vol_ax.clear()
+        self.pnl_ax.clear()
+        apply_axis_bg(self.vol_ax, None)
         if not self.points and not self.universal_mid_points:
-            self.ax.set_title("Spot Close vs Time")
-            self.ax.set_xlabel("Time IST")
-            self.ax.set_ylabel("Price")
-            self.ax.grid(True)
+            self.vol_ax.set_title("ATM Vol and Universal Mid Vol vs Time")
+            self.vol_ax.set_xlabel("Time IST")
+            self.vol_ax.set_ylabel("Vol")
+            self.pnl_ax.set_ylabel("Total PnL")
+            self.vol_ax.grid(True)
             self._set_metrics(
                 current_timestamp=current_timestamp,
                 current_close=None,
                 current_mid=None,
                 basis=None,
+                atm_vol=atm_vol,
                 vol_spot=None,
+                full_day_vol_spot=None,
                 vol_mid=None,
+                full_day_vol_mid=None,
+                total_pnl=total_pnl,
+                gamma_diff_total=self.gamma_diff_total(),
+                frozen_iv_total_pnl=frozen_iv_total_pnl,
                 spot_rows=0,
                 source="No spot or universal mid data loaded for this replay date",
             )
-            self.canvas.draw()
+            self.price_tab.render(current_timestamp)
+            self._render_top_universal_mid_moves()
+            self.vol_canvas.draw()
             return
 
-        current_close, elapsed_spot_points = self._render_spot_series(current_timestamp)
-        current_mid = self._render_universal_mid_series()
+        current_close = self.current_spot_close(current_timestamp)
+        current_mid = self.current_universal_mid()
+        elapsed_spot_points = self.elapsed_spot_points(current_timestamp)
         vol_spot = annualized_running_vol(
             elapsed_spot_points,
             calendar_days,
@@ -1169,30 +1235,38 @@ class SpotTimeTab:
             calendar_days,
             intraday_var,
         )
+        full_day_vol_spot, full_day_vol_mid = self.full_day_vols(
+            current_timestamp,
+            calendar_days,
+            intraday_var,
+        )
+        self._record_metric_point(self.vol_mid_points, current_timestamp, vol_mid)
         basis = (
             universal_mid - current_close
             if universal_mid is not None and current_close is not None
             else None
         )
 
-        self.ax.axvline(current_timestamp, color="#d32f2f", linestyle="--", linewidth=1)
-        self.ax.set_title("NIFTY Spot Close and Universal Mid vs Time")
-        self.ax.set_xlabel("Time IST")
-        self.ax.set_ylabel("Price")
-        self.ax.grid(True)
-        self.ax.legend()
-        self.fig.autofmt_xdate()
+        self.price_tab.render(current_timestamp)
+        self._render_vol_series(current_timestamp)
+        self._render_top_universal_mid_moves()
         self._set_metrics(
             current_timestamp=current_timestamp,
             current_close=current_close,
             current_mid=current_mid,
             basis=basis,
+            atm_vol=atm_vol,
             vol_spot=vol_spot,
+            full_day_vol_spot=full_day_vol_spot,
             vol_mid=vol_mid,
+            full_day_vol_mid=full_day_vol_mid,
+            total_pnl=total_pnl,
+            gamma_diff_total=self.gamma_diff_total(),
+            frozen_iv_total_pnl=frozen_iv_total_pnl,
             spot_rows=len(self.points),
             source=self.source,
         )
-        self.canvas.draw()
+        self.vol_canvas.draw()
 
     def _set_metrics(
         self,
@@ -1200,8 +1274,14 @@ class SpotTimeTab:
         current_close: float | None,
         current_mid: float | None,
         basis: float | None,
+        atm_vol: float | None,
         vol_spot: float | None,
+        full_day_vol_spot: float | None,
         vol_mid: float | None,
+        full_day_vol_mid: float | None,
+        total_pnl: float | None,
+        gamma_diff_total: float | None,
+        frozen_iv_total_pnl: float | None,
         spot_rows: int,
         source: str | None,
     ) -> None:
@@ -1216,11 +1296,27 @@ class SpotTimeTab:
         self.metric_vars["Basis"].set(
             format_optional_number(basis) if basis is not None else "--"
         )
+        self.metric_vars["ATM Vol"].set(
+            format_percent(atm_vol) if atm_vol is not None else "--"
+        )
         self.metric_vars["Vol Spot"].set(
-            format_percent(vol_spot) if vol_spot is not None else "--"
+            format_vol_pair(vol_spot, full_day_vol_spot)
         )
         self.metric_vars["Vol Universal Mid"].set(
-            format_percent(vol_mid) if vol_mid is not None else "--"
+            format_vol_pair(vol_mid, full_day_vol_mid)
+        )
+        self.metric_vars["Total PnL"].set(
+            format_number(total_pnl, 2) if total_pnl is not None else "--"
+        )
+        self.metric_vars["Gamma Diff Total"].set(
+            format_number(gamma_diff_total, 2)
+            if gamma_diff_total is not None
+            else "--"
+        )
+        self.metric_vars["Frozen IV Total PnL"].set(
+            format_number(frozen_iv_total_pnl, 2)
+            if frozen_iv_total_pnl is not None
+            else "--"
         )
         self.metric_vars["Source"].set(source or "--")
 
@@ -1236,6 +1332,17 @@ class SpotTimeTab:
             or self.universal_mid_points[-1][0] != current_timestamp
         ):
             self.universal_mid_points.append((current_timestamp, universal_mid))
+
+    @staticmethod
+    def _record_metric_point(
+        points: list[tuple[datetime, float]],
+        current_timestamp: datetime,
+        value: float | None,
+    ) -> None:
+        if value is None:
+            return
+        if not points or points[-1][0] != current_timestamp:
+            points.append((current_timestamp, value))
 
     def full_day_vols(
         self,
@@ -1266,19 +1373,327 @@ class SpotTimeTab:
             if timestamp <= current_timestamp
         ]
 
-    def _render_spot_series(
+    def current_spot_close(
         self,
         current_timestamp: datetime,
-    ) -> tuple[float | None, list[tuple[datetime, float]]]:
+    ) -> float | None:
+        elapsed_points = self.elapsed_spot_points(current_timestamp)
+        if not elapsed_points:
+            return None
+        return elapsed_points[-1][1]
+
+    def current_universal_mid(self) -> float | None:
+        if not self.universal_mid_points:
+            return None
+        return self.universal_mid_points[-1][1]
+
+    def _render_vol_series(self, current_timestamp: datetime) -> None:
+        if self.vol_ax is None or self.pnl_ax is None or self.vol_fig is None:
+            return
+
+        vol_lines = []
+        pnl_lines = []
+        if self.atm_vol_points:
+            times = [timestamp for timestamp, _ in self.atm_vol_points]
+            vols = [vol * 100 for _, vol in self.atm_vol_points]
+            line = self.vol_ax.plot(
+                times,
+                vols,
+                color="#2e7d32",
+                linewidth=1.8,
+                label="ATM vol",
+            )[0]
+            vol_lines.append(line)
+            self.vol_ax.scatter(
+                [times[-1]],
+                [vols[-1]],
+                color="#2e7d32",
+                s=24,
+                zorder=3,
+            )
+
+        if self.vol_mid_points:
+            times = [timestamp for timestamp, _ in self.vol_mid_points]
+            vols = [vol * 100 for _, vol in self.vol_mid_points]
+            line = self.vol_ax.plot(
+                times,
+                vols,
+                color="#6a1b9a",
+                linewidth=1.8,
+                label="Vol universal mid",
+            )[0]
+            vol_lines.append(line)
+            self.vol_ax.scatter(
+                [times[-1]],
+                [vols[-1]],
+                color="#6a1b9a",
+                s=24,
+                zorder=3,
+            )
+
+        if self.total_pnl_points:
+            times = [timestamp for timestamp, _ in self.total_pnl_points]
+            pnls = [pnl for _, pnl in self.total_pnl_points]
+            line = self.pnl_ax.plot(
+                times,
+                pnls,
+                color="#455a64",
+                linewidth=1.7,
+                linestyle="-.",
+                label="Total PnL",
+            )[0]
+            pnl_lines.append(line)
+            self.pnl_ax.scatter(
+                [times[-1]],
+                [pnls[-1]],
+                color="#455a64",
+                s=24,
+                zorder=3,
+            )
+            self.pnl_ax.axhline(0, color="#9e9e9e", linewidth=1)
+
+        self.vol_ax.axvline(current_timestamp, color="#d32f2f", linestyle="--", linewidth=1)
+        self.vol_ax.set_title("ATM Vol and Universal Mid Vol vs Time")
+        self.vol_ax.set_xlabel("Time IST")
+        self.vol_ax.set_ylabel("Vol (%)")
+        self.pnl_ax.set_ylabel("Total PnL")
+        self.vol_ax.grid(True)
+        legend_lines = vol_lines + pnl_lines
+        if legend_lines:
+            self.vol_ax.legend(
+                legend_lines,
+                [line.get_label() for line in legend_lines],
+                loc="best",
+            )
+        self.vol_fig.autofmt_xdate()
+
+    def _build_top_moves_panel(self, parent: tk.Frame) -> None:
+        columns = (
+            "time",
+            "um_move_pct",
+            "spot_move_pct",
+            "pnl_change",
+            "gamma_l",
+            "gamma_pnl",
+            "capped_gamma_pnl",
+            "gamma_pnl_diff",
+        )
+        self.top_moves_tree = ttk.Treeview(
+            parent,
+            columns=columns,
+            show="headings",
+            height=7,
+        )
+        headings = {
+            "time": "Time",
+            "um_move_pct": "UM Move",
+            "spot_move_pct": "Spot Move",
+            "pnl_change": "PnL Chg",
+            "gamma_l": "Gamma in L",
+            "gamma_pnl": "Gamma PnL",
+            "capped_gamma_pnl": "Capped Gamma PnL",
+            "gamma_pnl_diff": "Diff",
+        }
+        widths = {
+            "time": 105,
+            "um_move_pct": 90,
+            "spot_move_pct": 90,
+            "pnl_change": 95,
+            "gamma_l": 95,
+            "gamma_pnl": 100,
+            "capped_gamma_pnl": 130,
+            "gamma_pnl_diff": 90,
+        }
+        for column in columns:
+            self.top_moves_tree.heading(column, text=headings[column])
+            self.top_moves_tree.column(column, width=widths[column], anchor="center")
+        self.top_moves_tree.pack(fill="y", expand=False, padx=6, pady=6)
+
+    def _render_top_universal_mid_moves(self) -> None:
+        if self.top_moves_tree is None:
+            return
+
+        for item in self.top_moves_tree.get_children():
+            self.top_moves_tree.delete(item)
+        for row in self._large_universal_mid_moves():
+            self.top_moves_tree.insert(
+                "",
+                "end",
+                values=(
+                    row["time"],
+                    row["um_move_pct"],
+                    row["spot_move_pct"],
+                    row["pnl_change"],
+                    row["gamma_l"],
+                    row["gamma_pnl"],
+                    row["capped_gamma_pnl"],
+                    row["gamma_pnl_diff"],
+                ),
+            )
+
+    def _large_universal_mid_moves(self) -> list[dict[str, str]]:
+        pnl_by_timestamp = {timestamp: pnl for timestamp, pnl in self.total_pnl_points}
+        spot_by_timestamp = {timestamp: close for timestamp, close in self.points}
+        gamma_by_timestamp = {timestamp: gamma_l for timestamp, gamma_l in self.gamma_l_points}
+        moves = []
+        for (previous_time, previous_mid), (timestamp, mid) in zip(
+            self.universal_mid_points,
+            self.universal_mid_points[1:],
+        ):
+            if not is_top_move_time(timestamp) or previous_mid <= 0:
+                continue
+            move_return = mid / previous_mid - 1
+            move_pct = move_return * 100
+            if abs(move_return) <= 0.001:
+                continue
+            previous_pnl = pnl_by_timestamp.get(previous_time)
+            total_pnl = pnl_by_timestamp.get(timestamp)
+            pnl_change = (
+                total_pnl - previous_pnl
+                if total_pnl is not None and previous_pnl is not None
+                else None
+            )
+            previous_spot = spot_by_timestamp.get(previous_time)
+            spot = spot_by_timestamp.get(timestamp)
+            spot_move_pct = (
+                (spot / previous_spot - 1) * 100
+                if spot is not None and previous_spot not in (None, 0)
+                else None
+            )
+            gamma_l = gamma_by_timestamp.get(timestamp)
+            gamma_pnl = (
+                0.5 * (gamma_l * 100000 * 10) * move_return * move_return * 100 / 1000
+                if gamma_l is not None
+                else None
+            )
+            capped_gamma_pnl = (
+                capped_gamma_pnl_for_move(gamma_l, move_return)
+                if gamma_l is not None
+                else None
+            )
+            gamma_pnl_diff = (
+                capped_gamma_pnl - gamma_pnl
+                if gamma_pnl is not None and capped_gamma_pnl is not None
+                else None
+            )
+            moves.append(
+                {
+                    "abs_move_pct": abs(move_pct),
+                    "time": f"{previous_time:%H:%M}-{timestamp:%H:%M}",
+                    "um_move_pct": f"{move_pct:.3f}%",
+                    "spot_move_pct": (
+                        f"{spot_move_pct:.3f}%"
+                        if spot_move_pct is not None
+                        else "--"
+                    ),
+                    "pnl_change": (
+                        format_number(pnl_change, 2)
+                        if pnl_change is not None
+                        else "--"
+                    ),
+                    "gamma_l": (
+                        format_number(gamma_l, 2)
+                        if gamma_l is not None
+                        else "--"
+                    ),
+                    "gamma_pnl": (
+                        format_number(gamma_pnl, 2)
+                        if gamma_pnl is not None
+                        else "--"
+                    ),
+                    "capped_gamma_pnl": (
+                        format_number(capped_gamma_pnl, 2)
+                        if capped_gamma_pnl is not None
+                        else "--"
+                    ),
+                    "gamma_pnl_diff": (
+                        format_number(gamma_pnl_diff, 2)
+                        if gamma_pnl_diff is not None
+                        else "--"
+                    ),
+                    "gamma_pnl_diff_value": gamma_pnl_diff,
+                }
+            )
+        moves.sort(key=lambda row: row["abs_move_pct"], reverse=True)
+        large_moves = moves
+        diff_total = sum(
+            row["gamma_pnl_diff_value"]
+            for row in large_moves
+            if isinstance(row["gamma_pnl_diff_value"], (int, float))
+        )
+        if large_moves:
+            large_moves.append(
+                {
+                    "abs_move_pct": -1,
+                    "time": "Total",
+                    "um_move_pct": "",
+                    "spot_move_pct": "",
+                    "pnl_change": "",
+                    "gamma_l": "",
+                    "gamma_pnl": "",
+                    "capped_gamma_pnl": "",
+                    "gamma_pnl_diff": format_number(diff_total, 2),
+                    "gamma_pnl_diff_value": diff_total,
+                }
+            )
+        return large_moves
+
+    def gamma_diff_total(self) -> float | None:
+        rows = self._large_universal_mid_moves()
+        for row in reversed(rows):
+            if row["time"] == "Total":
+                value = row["gamma_pnl_diff_value"]
+                return value if isinstance(value, (int, float)) else None
+        return None
+
+
+class SpotUniversalMidTab:
+    def __init__(
+        self,
+        parent: tk.Frame,
+        points: list[tuple[datetime, float]],
+        universal_mid_points: list[tuple[datetime, float]],
+    ) -> None:
+        self.parent = parent
+        self.points = points
+        self.universal_mid_points = universal_mid_points
+        self.fig: Figure
+        self.ax = None
+        self.canvas = None
+        self.fig, self.ax, self.canvas = build_plot(self.parent)
+
+    def render(self, current_timestamp: datetime) -> None:
+        if self.ax is None or self.canvas is None:
+            return
+
+        self.ax.clear()
+        apply_axis_bg(self.ax, None)
+        self._render_spot_series(current_timestamp)
+        self._render_universal_mid_series()
+        self.ax.axvline(current_timestamp, color="#d32f2f", linestyle="--", linewidth=1)
+        self.ax.set_title("NIFTY Spot Close and Universal Mid vs Time")
+        self.ax.set_xlabel("Time IST")
+        self.ax.set_ylabel("Price")
+        self.ax.grid(True)
+        if self.points or self.universal_mid_points:
+            self.ax.legend()
+        self.fig.autofmt_xdate()
+        self.canvas.draw()
+
+    def _render_spot_series(self, current_timestamp: datetime) -> None:
         if not self.points:
-            return None, []
+            return
 
         times = [timestamp for timestamp, _ in self.points]
         closes = [close for _, close in self.points]
-        elapsed_points = self.elapsed_spot_points(current_timestamp)
+        elapsed_points = [
+            (timestamp, close)
+            for timestamp, close in self.points
+            if timestamp <= current_timestamp
+        ]
         self.ax.plot(times, closes, color="#b8b8b8", linewidth=1.1, label="Spot full day")
         if not elapsed_points:
-            return None, []
+            return
 
         elapsed_times = [timestamp for timestamp, _ in elapsed_points]
         elapsed_closes = [close for _, close in elapsed_points]
@@ -1296,11 +1711,10 @@ class SpotTimeTab:
             s=24,
             zorder=3,
         )
-        return elapsed_closes[-1], elapsed_points
 
-    def _render_universal_mid_series(self) -> float | None:
+    def _render_universal_mid_series(self) -> None:
         if not self.universal_mid_points:
-            return None
+            return
 
         times = [timestamp for timestamp, _ in self.universal_mid_points]
         mids = [mid for _, mid in self.universal_mid_points]
@@ -1318,7 +1732,6 @@ class SpotTimeTab:
             s=24,
             zorder=3,
         )
-        return mids[-1]
 
 
 class PortfolioRiskTab:
@@ -1329,7 +1742,7 @@ class PortfolioRiskTab:
         self.options_pnl_var = tk.StringVar(value="Options PnL: ")
         self.hedge_pnl_var = tk.StringVar(value="Delta Hedge PnL: ")
         self.total_pnl_var = tk.StringVar(value="Total PnL: ")
-        self.final_delta_var = tk.StringVar(value="Final Delta: ")
+        self.final_delta_var = tk.StringVar(value="Final BS Delta: ")
         self.hedge_status_var = tk.StringVar(value="Hedge starts at 09:20")
         self.full_day_vol_var = tk.StringVar(
             value="Full-Day Vol Spot: -- | Full-Day Vol Universal Mid: --"
@@ -1341,6 +1754,8 @@ class PortfolioRiskTab:
         self.hedge_strike: int | None = None
         self.hedge_trades: list[dict[str, float | str]] = []
         self.cumulative_hedge_lots = 0.0
+        self.last_total_pnl: float | None = None
+        self.last_gamma_l: float | None = None
         self.data_writer = PortfolioDataWriter(BACKTEST_OUTPUT_DIR)
         self.columns = [
             "Lots",
@@ -1506,8 +1921,12 @@ class PortfolioRiskTab:
 
         totals = ()
         options_pv = weighted_price_total(risk_rows, "mid_mkt")
+        self.last_gamma_l = None
         if risk_rows:
             totals = self._total_row_numeric_values(risk_rows, result, numeric_rows)
+            self.last_gamma_l = (
+                totals[22] if isinstance(totals[22], (int, float)) else None
+            )
             self._set_row(
                 row_index,
                 self._total_row_values(risk_rows, result, numeric_rows),
@@ -1522,7 +1941,7 @@ class PortfolioRiskTab:
             rows_by_strike,
             timestamp,
             options_pv,
-            totals[21] if totals else None,
+            totals[19] if totals else None,
             funding_rate,
             brokerage_rate,
             hedge_threshold,
@@ -1758,12 +2177,12 @@ class PortfolioRiskTab:
         rows_by_strike: dict,
         timestamp: datetime | None,
         options_pv: float,
-        options_net_delta: float | str | None,
+        options_bs_delta_lots: float | str | None,
         funding_rate: float,
         brokerage_rate: float,
         hedge_threshold: float,
     ) -> None:
-        if timestamp is None or not isinstance(options_net_delta, (int, float)):
+        if timestamp is None or not isinstance(options_bs_delta_lots, (int, float)):
             self._render_pnl_values(None, None)
             return
 
@@ -1771,7 +2190,7 @@ class PortfolioRiskTab:
             self.options_pv_snapshot = options_pv
             self.hedge_strike = nearest_result_strike(result, result.universal_mid)
             self._add_hedge_trade(
-                round(-options_net_delta),
+                round(-options_bs_delta_lots),
                 result,
                 rows_by_strike,
                 timestamp,
@@ -1780,7 +2199,7 @@ class PortfolioRiskTab:
                 reason="Initial hedge",
             )
         elif self.options_pv_snapshot is not None and self.hedge_strike is not None:
-            combined_delta = options_net_delta + self.cumulative_hedge_lots
+            combined_delta = options_bs_delta_lots + self.cumulative_hedge_lots
             if abs(combined_delta) > hedge_threshold:
                 self._add_hedge_trade(
                     round(-combined_delta),
@@ -1798,7 +2217,8 @@ class PortfolioRiskTab:
             else None
         )
         self.final_delta_var.set(
-            f"Final Delta: {format_number(options_net_delta + self.cumulative_hedge_lots, 2)}"
+            "Final BS Delta: "
+            f"{format_number(options_bs_delta_lots + self.cumulative_hedge_lots, 2)}"
         )
         hedge_pnl = self._hedge_pnl(result, rows_by_strike, funding_rate, brokerage_rate)
         self._render_pnl_values(options_pnl, hedge_pnl)
@@ -1814,9 +2234,9 @@ class PortfolioRiskTab:
             options_pv,
             self.options_pv_snapshot,
             options_pnl,
-            options_net_delta,
+            options_bs_delta_lots,
             self.cumulative_hedge_lots,
-            options_net_delta + self.cumulative_hedge_lots,
+            options_bs_delta_lots + self.cumulative_hedge_lots,
             self.hedge_strike,
             hedge_pnl,
             len(self.hedge_trades),
@@ -1941,9 +2361,287 @@ class PortfolioRiskTab:
         hedge_pnl: float | None,
     ) -> None:
         total = (options_pnl or 0.0) + (hedge_pnl or 0.0)
+        self.last_total_pnl = total
         self.options_pnl_var.set(f"Options PnL: {format_optional_number(options_pnl)}")
         self.hedge_pnl_var.set(f"Delta Hedge PnL: {format_optional_number(hedge_pnl)}")
         self.total_pnl_var.set(f"Total PnL: {format_number(total, 2)}")
+
+
+class FrozenIvPortfolioTab(PortfolioRiskTab):
+    def __init__(self, parent: tk.Frame) -> None:
+        super().__init__(parent, hedges_tab=None)
+        self.frozen_iv: float | None = None
+        self.frozen_timestamp: datetime | None = None
+        self.frozen_positions: list | None = None
+        self.data_writer = NullPortfolioDataWriter()
+        self.status_var.set("Waiting for 09:20 frozen-IV snapshot")
+        self.full_day_vol_var.set("Frozen IV: --")
+
+    def render(
+        self,
+        session: ExpirySession,
+        result: AnalyticsResult,
+        timestamp: datetime | None,
+        funding_rate: float,
+        brokerage_rate: float,
+        hedge_threshold: float,
+    ) -> None:
+        if timestamp is None:
+            self.status_var.set("Waiting for replay timestamp")
+            return
+        if self.frozen_iv is None:
+            if not is_hedge_start_time(timestamp):
+                self.status_var.set("Waiting for 09:20 frozen-IV snapshot")
+                return
+            self.frozen_iv = result.atm_vol
+            self.frozen_timestamp = timestamp
+            portfolio = build_sample_portfolio(session, result)
+            if portfolio is None:
+                self.status_var.set("Waiting for enough strikes to freeze portfolio")
+                self.frozen_iv = None
+                self.frozen_timestamp = None
+                return
+            self.frozen_positions = portfolio.positions
+
+        positions = self.frozen_positions or []
+        risk_rows = self._frozen_risk_rows(positions, result, funding_rate)
+        super().render(
+            result,
+            risk_rows,
+            positions,
+            f"{session.spec.tab_name} Frozen IV",
+            timestamp,
+            result.time,
+            funding_rate,
+            brokerage_rate,
+            hedge_threshold,
+            None,
+            None,
+        )
+        self.full_day_vol_var.set(
+            f"Frozen IV: {format_percent_or_dash(self.frozen_iv)} | "
+            f"Frozen at: {format_ist_timestamp(self.frozen_timestamp)}"
+        )
+
+    def _row_values(
+        self,
+        row,
+        result: AnalyticsResult,
+        rows_by_strike: dict,
+        risk_free_rate: float,
+    ) -> tuple:
+        return insert_columns(risk_row_values(row, result), 20, ("", ""))
+
+    def _row_numeric_values(
+        self,
+        row,
+        result: AnalyticsResult,
+        rows_by_strike: dict,
+        risk_free_rate: float,
+    ) -> tuple:
+        return insert_columns(risk_row_numeric_values(row, result), 20, ("", ""))
+
+    def _update_pnl(
+        self,
+        result: AnalyticsResult,
+        rows_by_strike: dict,
+        timestamp: datetime | None,
+        options_pv: float,
+        options_bs_delta_lots: float | str | None,
+        funding_rate: float,
+        brokerage_rate: float,
+        hedge_threshold: float,
+    ) -> None:
+        if timestamp is None or not isinstance(options_bs_delta_lots, (int, float)):
+            self._render_pnl_values(None, None)
+            return
+
+        if self.options_pv_snapshot is None:
+            self.options_pv_snapshot = options_pv
+            self.hedge_strike = nearest_result_strike(result, result.universal_mid)
+            self._add_hedge_trade(
+                round(-options_bs_delta_lots),
+                result,
+                rows_by_strike,
+                timestamp,
+                funding_rate,
+                brokerage_rate,
+                reason="Initial frozen-IV hedge",
+            )
+        elif self.hedge_strike is not None:
+            combined_delta = options_bs_delta_lots + self.cumulative_hedge_lots
+            if abs(combined_delta) > hedge_threshold:
+                self._add_hedge_trade(
+                    round(-combined_delta),
+                    result,
+                    rows_by_strike,
+                    timestamp,
+                    funding_rate,
+                    brokerage_rate,
+                    reason="Frozen-IV threshold hedge",
+                )
+
+        options_pnl = (
+            options_pv - self.options_pv_snapshot
+            if self.options_pv_snapshot is not None
+            else None
+        )
+        self.final_delta_var.set(
+            "Final BS Delta: "
+            f"{format_number(options_bs_delta_lots + self.cumulative_hedge_lots, 2)}"
+        )
+        hedge_pnl = self._hedge_pnl(result, rows_by_strike, funding_rate, brokerage_rate)
+        self._render_pnl_values(options_pnl, hedge_pnl)
+        if self.hedge_strike is None:
+            self.hedge_status_var.set("Hedge starts at 09:20")
+        else:
+            self.hedge_status_var.set(
+                f"Hedge Strike: {self.hedge_strike} | "
+                f"Hedge Lots: {format_number(self.cumulative_hedge_lots, 2)} | "
+                f"Trades: {len(self.hedge_trades)}"
+            )
+
+    def _frozen_risk_rows(
+        self,
+        positions: list,
+        result: AnalyticsResult,
+        funding_rate: float,
+    ) -> list[RiskRow]:
+        if self.frozen_iv is None:
+            return []
+        rows_by_strike = {row.strike: row for row in result.rows}
+        risk_rows = []
+        for position in positions:
+            market_row = rows_by_strike.get(position.strike)
+            if market_row is None:
+                risk_rows.append(self._blank_frozen_row(position))
+                continue
+            risk_rows.append(self._frozen_position_row(position, result, funding_rate))
+        return risk_rows
+
+    def _frozen_position_row(
+        self,
+        position,
+        result: AnalyticsResult,
+        funding_rate: float,
+    ) -> RiskRow:
+        frozen_iv = self.frozen_iv or 0.0
+        vol_pct = frozen_iv * 100
+        rate = funding_rate
+        spot = result.universal_spot
+        time = result.time
+        qty = position.qty
+        mult = position.mult
+
+        price_fit = black_scholes_price(
+            spot,
+            position.strike,
+            time,
+            rate,
+            frozen_iv,
+            position.option_type,
+        )
+        intrinsic_value = intrinsic_value_from_synthetic_mid(
+            position.option_type,
+            result.universal_mid,
+            position.strike,
+        )
+        time_value = price_fit - intrinsic_value
+        delta = black_scholes_delta(
+            spot,
+            position.strike,
+            time,
+            rate,
+            frozen_iv,
+            position.option_type,
+        )
+        gamma = black_scholes_gamma(spot, position.strike, time, rate, frozen_iv)
+        vega = black_scholes_vega(spot, position.strike, time, rate, frozen_iv)
+        time_unit = (15 / 375) * 0.4 / 255.5
+        theta_price_change = black_scholes_theta_price_change(
+            spot,
+            position.strike,
+            time,
+            time_unit,
+            rate,
+            frozen_iv,
+            position.option_type,
+        )
+
+        bs_delta_pct = delta
+        bs_delta_ccy = bs_delta_pct * spot * qty / 100000
+        bs_delta_lots = bs_delta_ccy * 100000 / mult / spot if mult and spot else 0
+        gamma_ccy_10bps = gamma * spot * spot * 0.01 * qty / 100000 / 10
+        gamma_lots_10bps = (
+            gamma_ccy_10bps * 100000 / spot / mult if spot and mult else 0
+        )
+        vega_ccy_10bps = vega / 100 / 10 * qty
+        bs_theta_ccy = theta_price_change * qty
+        std_1w_vega = (
+            vega_ccy_10bps / math.sqrt(time) * math.sqrt(5 / 248)
+            if time > 0
+            else 0
+        )
+
+        return RiskRow(
+            book=position.book,
+            lots=position.lots,
+            underlying=position.underlying,
+            maturity=position.maturity,
+            strike=position.strike,
+            option_type=position.option_type,
+            qty=qty,
+            mult=mult,
+            time_value=time_value,
+            price_fit=price_fit,
+            bid_mkt=price_fit,
+            ask_mkt=price_fit,
+            mid_mkt=price_fit,
+            model_iv=vol_pct,
+            bs_delta_pct=bs_delta_pct,
+            bs_delta_ccy=bs_delta_ccy,
+            bs_delta_lots=bs_delta_lots,
+            gamma_ccy_10bps=gamma_ccy_10bps,
+            gamma_lots_10bps=gamma_lots_10bps,
+            vega_ccy_10bps=vega_ccy_10bps,
+            bs_theta_ccy=bs_theta_ccy,
+            std_1w_vega=std_1w_vega,
+        )
+
+    @staticmethod
+    def _blank_frozen_row(position) -> RiskRow:
+        return RiskRow(
+            book=position.book,
+            lots=position.lots,
+            underlying=position.underlying,
+            maturity=position.maturity,
+            strike=position.strike,
+            option_type=position.option_type,
+            qty=position.qty,
+            mult=position.mult,
+            time_value="",
+            price_fit="",
+            bid_mkt="",
+            ask_mkt="",
+            mid_mkt="",
+            model_iv="",
+            bs_delta_pct="",
+            bs_delta_ccy="",
+            bs_delta_lots="",
+            gamma_ccy_10bps="",
+            gamma_lots_10bps="",
+            vega_ccy_10bps="",
+            bs_theta_ccy="",
+            std_1w_vega="",
+        )
+
+
+class NullPortfolioDataWriter:
+    def write_cycle(self, *args, **kwargs) -> None:
+        return
+
+    def write_hedge_trades(self, rows: list[dict[str, float | str]]) -> None:
+        return
 
 
 class HedgesTab:
@@ -2046,9 +2744,9 @@ class PortfolioDataWriter:
         options_pv: float,
         options_pv_snapshot: float | None,
         options_pnl: float | None,
-        options_net_delta: float,
+        options_bs_delta_lots: float,
         cumulative_hedge_lots: float,
-        final_delta: float,
+        final_bs_delta_lots: float,
         hedge_strike: int | None,
         hedge_pnl: float | None,
         hedge_trade_count: int,
@@ -2067,9 +2765,9 @@ class PortfolioDataWriter:
                 "options_pv",
                 "options_pv_snapshot",
                 "options_pnl",
-                "options_net_delta",
+                "options_bs_delta_lots",
                 "cumulative_hedge_lots",
-                "final_delta",
+                "final_bs_delta_lots",
                 "hedge_strike",
                 "hedge_pnl",
                 "total_pnl",
@@ -2083,9 +2781,9 @@ class PortfolioDataWriter:
                 "options_pv": options_pv,
                 "options_pv_snapshot": "" if options_pv_snapshot is None else options_pv_snapshot,
                 "options_pnl": "" if options_pnl is None else options_pnl,
-                "options_net_delta": options_net_delta,
+                "options_bs_delta_lots": options_bs_delta_lots,
                 "cumulative_hedge_lots": cumulative_hedge_lots,
-                "final_delta": final_delta,
+                "final_bs_delta_lots": final_bs_delta_lots,
                 "hedge_strike": "" if hedge_strike is None else hedge_strike,
                 "hedge_pnl": "" if hedge_pnl is None else hedge_pnl,
                 "total_pnl": (options_pnl or 0.0) + (hedge_pnl or 0.0),
@@ -2176,6 +2874,21 @@ def sum_numeric_column(rows: list[tuple], col_index: int) -> float | str:
 
 def is_hedge_start_time(timestamp: datetime) -> bool:
     return (timestamp.hour, timestamp.minute) >= (9, 20)
+
+
+def is_top_move_time(timestamp: datetime) -> bool:
+    return (9, 20) <= (timestamp.hour, timestamp.minute) <= (15, 24)
+
+
+def capped_gamma_pnl_for_move(gamma_l: float, move_return: float) -> float:
+    remaining_move = abs(move_return)
+    capped_pnl = 0.0
+    max_chunk = 0.001
+    while remaining_move > 0:
+        chunk = min(max_chunk, remaining_move)
+        capped_pnl += 0.5 * (gamma_l * 100000 * 10) * chunk * chunk * 100 / 1000
+        remaining_move -= chunk
+    return capped_pnl
 
 
 def annualized_running_vol(
@@ -2437,6 +3150,10 @@ def format_percent_or_dash(value) -> str:
     if value is None or value == "":
         return "--"
     return format_percent(value)
+
+
+def format_vol_pair(running_vol, full_day_vol) -> str:
+    return f"{format_percent_or_dash(running_vol)}    ||    {format_percent_or_dash(full_day_vol)}"
 
 
 def format_vol(value) -> str:

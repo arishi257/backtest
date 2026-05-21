@@ -41,7 +41,7 @@ def main() -> None:
         spot_series = load_spot_series(dataset.trade_date)
         spot_points = spot_series.points
         spot_source = str(spot_series.source_path)
-    except (FileNotFoundError, ValueError) as exc:
+    except (FileNotFoundError, OSError, ValueError) as exc:
         print(f"Spot data unavailable: {exc}")
 
     current_time = lambda: replay.now()
