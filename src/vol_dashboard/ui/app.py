@@ -23,9 +23,15 @@ from fit_sensex.pricing.black_scholes import (
     black_scholes_price,
     black_scholes_theta_price_change,
     black_scholes_vega,
+    implied_volatility,
 )
 from fit_sensex.pricing.vol_curve import ParametricVolCurve
-from fit_sensex.services.risk import RiskRow, intrinsic_value_from_synthetic_mid, synthetic_prices
+from fit_sensex.services.risk import (
+    RiskRow,
+    intrinsic_value_from_synthetic_mid,
+    option_market_prices,
+    synthetic_prices,
+)
 from fit_sensex.ui.app import (
     row_numeric_values as risk_row_numeric_values,
     row_values as risk_row_values,
@@ -532,15 +538,14 @@ class VolDashboardApp:
 
         if self.portfolio_risk is None:
             if (
-                nearest_session.spec.underlying == "SENSEX"
-                and self.last_live_timestamp is not None
+                self.last_live_timestamp is not None
                 and not is_hedge_start_time(self.last_live_timestamp)
             ):
                 self.portfolio_tab.set_status(
-                    "Waiting until 09:20 to create SENSEX portfolio"
+                    "Waiting until 09:20 to create portfolio"
                 )
                 self.frozen_iv_tab.set_status(
-                    "Waiting until 09:20 to freeze SENSEX portfolio"
+                    "Waiting until 09:20 to freeze portfolio"
                 )
                 return
             self.portfolio_risk = build_sample_portfolio(nearest_session, result)
@@ -2418,12 +2423,12 @@ class PortfolioRiskTab:
 class FrozenIvPortfolioTab(PortfolioRiskTab):
     def __init__(self, parent: tk.Frame) -> None:
         super().__init__(parent, hedges_tab=None)
-        self.frozen_iv: float | None = None
+        self.frozen_ivs: dict[tuple[int, str], float] = {}
         self.frozen_timestamp: datetime | None = None
         self.frozen_positions: list | None = None
         self.data_writer = NullPortfolioDataWriter()
-        self.status_var.set("Waiting for 09:20 frozen-IV snapshot")
-        self.full_day_vol_var.set("Frozen IV: --")
+        self.status_var.set("Waiting for 09:20 strike-IV snapshot")
+        self.full_day_vol_var.set("Frozen Strike IVs: --")
 
     def render(
         self,
@@ -2437,18 +2442,24 @@ class FrozenIvPortfolioTab(PortfolioRiskTab):
         if timestamp is None:
             self.status_var.set("Waiting for replay timestamp")
             return
-        if self.frozen_iv is None:
+        if not self.frozen_ivs:
             if not is_hedge_start_time(timestamp):
-                self.status_var.set("Waiting for 09:20 frozen-IV snapshot")
+                self.status_var.set("Waiting for 09:20 strike-IV snapshot")
                 return
-            self.frozen_iv = result.atm_vol
-            self.frozen_timestamp = timestamp
             portfolio = build_sample_portfolio(session, result)
             if portfolio is None:
                 self.status_var.set("Waiting for enough strikes to freeze portfolio")
-                self.frozen_iv = None
-                self.frozen_timestamp = None
                 return
+            frozen_ivs = self._capture_position_ivs(
+                portfolio.positions,
+                result,
+                funding_rate,
+            )
+            if len(frozen_ivs) != len(portfolio.positions):
+                self.status_var.set("Waiting for valid 09:20 IVs to freeze portfolio")
+                return
+            self.frozen_ivs = frozen_ivs
+            self.frozen_timestamp = timestamp
             self.frozen_positions = portfolio.positions
 
         positions = self.frozen_positions or []
@@ -2466,10 +2477,7 @@ class FrozenIvPortfolioTab(PortfolioRiskTab):
             None,
             None,
         )
-        self.full_day_vol_var.set(
-            f"Frozen IV: {format_percent_or_dash(self.frozen_iv)} | "
-            f"Frozen at: {format_ist_timestamp(self.frozen_timestamp)}"
-        )
+        self.full_day_vol_var.set(self._frozen_iv_summary())
 
     def _row_values(
         self,
@@ -2555,17 +2563,66 @@ class FrozenIvPortfolioTab(PortfolioRiskTab):
         result: AnalyticsResult,
         funding_rate: float,
     ) -> list[RiskRow]:
-        if self.frozen_iv is None:
+        if not self.frozen_ivs:
             return []
         rows_by_strike = {row.strike: row for row in result.rows}
         risk_rows = []
         for position in positions:
             market_row = rows_by_strike.get(position.strike)
-            if market_row is None:
+            if market_row is None or self._frozen_iv_for(position) is None:
                 risk_rows.append(self._blank_frozen_row(position))
                 continue
             risk_rows.append(self._frozen_position_row(position, result, funding_rate))
         return risk_rows
+
+    def _capture_position_ivs(
+        self,
+        positions: list,
+        result: AnalyticsResult,
+        funding_rate: float,
+    ) -> dict[tuple[int, str], float]:
+        rows_by_strike = {row.strike: row for row in result.rows}
+        frozen_ivs: dict[tuple[int, str], float] = {}
+        for position in positions:
+            market_row = rows_by_strike.get(position.strike)
+            if market_row is None:
+                continue
+            bid_mkt, ask_mkt = option_market_prices(market_row, position.option_type)
+            mid_mkt = (bid_mkt + ask_mkt) / 2
+            try:
+                iv = implied_volatility(
+                    mid_mkt,
+                    result.universal_spot,
+                    position.strike,
+                    result.time,
+                    funding_rate,
+                    position.option_type,
+                )
+            except (ValueError, ZeroDivisionError, OverflowError):
+                iv = None
+            if iv is not None:
+                frozen_ivs[self._position_key(position)] = iv
+        return frozen_ivs
+
+    def _frozen_iv_for(self, position) -> float | None:
+        return self.frozen_ivs.get(self._position_key(position))
+
+    @staticmethod
+    def _position_key(position) -> tuple[int, str]:
+        return (position.strike, position.option_type)
+
+    def _frozen_iv_summary(self) -> str:
+        if not self.frozen_ivs:
+            return "Frozen Strike IVs: --"
+        values = list(self.frozen_ivs.values())
+        average = sum(values) / len(values)
+        return (
+            f"Frozen Strike IVs: {len(values)} | "
+            f"Avg: {format_percent_or_dash(average)} | "
+            f"Range: {format_percent_or_dash(min(values))}-"
+            f"{format_percent_or_dash(max(values))} | "
+            f"Frozen at: {format_ist_timestamp(self.frozen_timestamp)}"
+        )
 
     def _frozen_position_row(
         self,
@@ -2573,7 +2630,7 @@ class FrozenIvPortfolioTab(PortfolioRiskTab):
         result: AnalyticsResult,
         funding_rate: float,
     ) -> RiskRow:
-        frozen_iv = self.frozen_iv or 0.0
+        frozen_iv = self._frozen_iv_for(position) or 0.0
         vol_pct = frozen_iv * 100
         rate = funding_rate
         spot = result.universal_spot

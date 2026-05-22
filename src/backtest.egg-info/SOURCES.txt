@@ -5,10 +5,13 @@ src/backtest/__main__.py
 src/backtest/config.py
 src/backtest/data.py
 src/backtest/main.py
+src/backtest/pnl_bucket_table.py
 src/backtest/portfolio.py
+src/backtest/processed_data.py
 src/backtest/replay.py
 src/backtest/runner.py
 src/backtest/sessions.py
+src/backtest/spot_data.py
 src/backtest.egg-info/PKG-INFO
 src/backtest.egg-info/SOURCES.txt
 src/backtest.egg-info/dependency_links.txt
