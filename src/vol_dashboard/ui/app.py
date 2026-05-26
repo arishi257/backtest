@@ -501,7 +501,7 @@ class VolDashboardApp:
                 self.spot_points,
                 self.spot_time_tab.universal_mid_points,
                 self.portfolio_tab.last_total_pnl,
-                self.portfolio_tab.last_gamma_l,
+                self.spot_time_tab.gamma_diff_total(),
                 self.frozen_iv_tab.last_total_pnl,
             )
         self.spot_time_tab.render(

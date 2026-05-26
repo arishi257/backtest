@@ -14,6 +14,7 @@ dependencies = [
 [project.scripts]
 backtest-dashboard = "backtest.main:main"
 backtest-runner = "backtest.runner:main"
+backtest-batch-runner = "backtest.batch_runner:main"
 
 [build-system]
 requires = ["setuptools>=68"]

@@ -16,6 +16,15 @@ DEFAULT_PROCESSED_DIR = PROJECT_ROOT / "processed_data"
 START_TIME = "09:20"
 END_TIME = "15:20"
 INTERVAL_MINUTES = 10
+PNL_METRICS = {
+    "total": (("portfolio_total_pnl",), "Portfolio Total PnL"),
+    "frozen-iv": (("frozen_iv_total_pnl",), "Frozen IV Total PnL"),
+    "gamma-diff": (("portfolio_gamma_diff_total",), "Gamma Diff PnL"),
+    "frozen-iv-gamma-diff": (
+        ("frozen_iv_total_pnl", "portfolio_gamma_diff_total"),
+        "Frozen IV PnL + Gamma Diff",
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -26,16 +35,68 @@ class BucketRow:
     total: float
 
 
+@dataclass(frozen=True)
+class SummaryRow:
+    date_key: str
+    underlying: str
+    frozen_iv_pnl: float | None
+    total_pnl: float | None
+    gamma_diff_pnl: float | None
+    full_spot_vol: float | None
+    full_um_mid_vol: float | None
+    frozen_closest_strike_avg_vol: float | None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Show processed PnL buckets in a GUI table.")
     parser.add_argument("--processed-dir", type=Path, default=DEFAULT_PROCESSED_DIR)
-    parser.add_argument("--year", default="2026")
+    parser.add_argument("--year", default="2026", help="Year or comma-separated years, e.g. 2025,2026.")
+    parser.add_argument("--start-date", help="Inclusive start date, e.g. 01012026.")
+    parser.add_argument("--end-date", help="Inclusive end date, e.g. 31032026.")
     parser.add_argument("--underlying", choices=("NIFTY", "SENSEX"), default=None)
+    parser.add_argument(
+        "--summary",
+        action="store_true",
+        help="Show date-level summary rows instead of 10-minute interval buckets.",
+    )
+    parser.add_argument(
+        "--closest-strikes",
+        type=int,
+        default=4,
+        help="Number of strikes closest to universal mid to average for summary IV.",
+    )
+    parser.add_argument(
+        "--metric",
+        choices=tuple(PNL_METRICS),
+        default="total",
+        help="PnL series to bucket. Use frozen-iv-gamma-diff for Frozen IV PnL + Gamma Diff.",
+    )
     args = parser.parse_args()
 
     intervals = interval_labels()
-    rows = load_bucket_rows(args.processed_dir, args.year, args.underlying, intervals)
-    show_table(rows, intervals, args.year, args.underlying)
+    date_filter = parse_date_filter(args.start_date, args.end_date)
+    years = years_for_filter(args.year, date_filter)
+    if args.summary:
+        rows = load_summary_rows(
+            args.processed_dir,
+            years,
+            args.underlying,
+            date_filter,
+            args.closest_strikes,
+        )
+        show_summary_table(rows, years, args.underlying, date_filter)
+        return
+
+    metric_fields, metric_label = PNL_METRICS[args.metric]
+    rows = load_bucket_rows(
+        args.processed_dir,
+        years,
+        args.underlying,
+        intervals,
+        metric_fields,
+        date_filter,
+    )
+    show_table(rows, intervals, years, args.underlying, metric_label, date_filter)
 
 
 def interval_points() -> list[str]:
@@ -55,13 +116,25 @@ def interval_labels() -> list[str]:
 
 def load_bucket_rows(
     processed_dir: Path,
-    year: str,
+    years: list[str],
     underlying_filter: str | None,
     intervals: list[str],
+    metric_fields: tuple[str, ...],
+    date_filter: tuple[datetime, datetime] | None = None,
 ) -> list[BucketRow]:
-    rows = []
+    rows_by_key: dict[tuple[str, str], BucketRow] = {}
     points = interval_points()
-    for path in sorted(processed_dir.glob(f"{year}*.csv"), reverse=True):
+    paths = sorted(
+        {
+            path
+            for year in years
+            for path in processed_dir.glob(f"{year}*.csv")
+        },
+        reverse=True,
+    )
+    for path in paths:
+        if not path_in_date_filter(path, date_filter):
+            continue
         with path.open(newline="") as file:
             data = list(csv.DictReader(file))
         if not data:
@@ -74,7 +147,7 @@ def load_bucket_rows(
         pnl_by_time = {}
         for record in data:
             timestamp = record.get("timestamp", "")
-            value = parse_float(record.get("portfolio_total_pnl"))
+            value = metric_value(record, metric_fields)
             if len(timestamp) >= 16 and value is not None:
                 pnl_by_time[timestamp[11:16]] = value
         available_times = sorted(pnl_by_time)
@@ -87,24 +160,85 @@ def load_bucket_rows(
                 None if start_value is None or end_value is None else end_value - start_value
             )
         total = sum(value for value in bucket_values if value is not None)
-        rows.append(BucketRow(path.stem, underlying, bucket_values, total))
-    return rows
+        row = BucketRow(path.stem, underlying, bucket_values, total)
+        key = (date_key_for_sort(path.stem), underlying)
+        existing = rows_by_key.get(key)
+        if existing is None or ("_" in path.stem and "_" not in existing.date_key):
+            rows_by_key[key] = row
+    return sorted(rows_by_key.values(), key=lambda row: row.date_key, reverse=True)
+
+
+def processed_paths(
+    processed_dir: Path,
+    years: list[str],
+    date_filter: tuple[datetime, datetime] | None = None,
+) -> list[Path]:
+    return sorted(
+        {
+            path
+            for year in years
+            for path in processed_dir.glob(f"{year}*.csv")
+            if path_in_date_filter(path, date_filter)
+        },
+        reverse=True,
+    )
+
+
+def load_summary_rows(
+    processed_dir: Path,
+    years: list[str],
+    underlying_filter: str | None,
+    date_filter: tuple[datetime, datetime] | None,
+    closest_strikes: int,
+) -> list[SummaryRow]:
+    rows_by_key: dict[tuple[str, str], SummaryRow] = {}
+    for path in processed_paths(processed_dir, years, date_filter):
+        with path.open(newline="") as file:
+            data = list(csv.DictReader(file))
+        if not data:
+            continue
+
+        underlying = (data[0].get("underlying") or "").upper()
+        if underlying_filter is not None and underlying != underlying_filter:
+            continue
+
+        row = SummaryRow(
+            date_key=path.stem,
+            underlying=underlying,
+            frozen_iv_pnl=last_float(data, "frozen_iv_total_pnl"),
+            total_pnl=last_float(data, "portfolio_total_pnl"),
+            gamma_diff_pnl=last_float(data, "portfolio_gamma_diff_total", default=0.0),
+            full_spot_vol=last_float(data, "vol_spot_full_day"),
+            full_um_mid_vol=last_float(data, "vol_universal_mid_full_day"),
+            frozen_closest_strike_avg_vol=closest_strike_average_iv(
+                data,
+                closest_strikes,
+            ),
+        )
+        key = (date_key_for_sort(path.stem), underlying)
+        existing = rows_by_key.get(key)
+        if existing is None or ("_" in path.stem and "_" not in existing.date_key):
+            rows_by_key[key] = row
+    return sorted(rows_by_key.values(), key=lambda row: row.date_key, reverse=True)
 
 
 def show_table(
     rows: list[BucketRow],
     intervals: list[str],
-    year: str,
+    years: list[str],
     underlying: str | None,
+    metric_label: str,
+    date_filter: tuple[datetime, datetime] | None,
 ) -> None:
     root = tk.Tk()
     suffix = f" - {underlying}" if underlying else ""
-    root.title(f"PnL {INTERVAL_MINUTES}-Min Buckets {year}{suffix}")
+    year_label = date_filter_label(years, date_filter)
+    root.title(f"{metric_label} {INTERVAL_MINUTES}-Min Buckets {year_label}{suffix}")
     root.geometry("1500x780")
 
     title = tk.Label(
         root,
-        text=f"Portfolio Total PnL Change by {INTERVAL_MINUTES}-Minute Interval ({year}){suffix}",
+        text=f"{metric_label} Change by {INTERVAL_MINUTES}-Minute Interval ({year_label}){suffix}",
         anchor="w",
         padx=10,
         pady=8,
@@ -128,9 +262,102 @@ def show_table(
     cumulative_totals = cumulative_values(totals)
 
     build_table_tab(table_tab, rows, intervals, totals, averages, medians)
-    build_chart_tab(chart_tab, intervals, totals, medians)
-    build_cumulative_chart_tab(cumulative_tab, intervals, cumulative_totals)
+    build_chart_tab(chart_tab, intervals, totals, medians, metric_label)
+    build_cumulative_chart_tab(cumulative_tab, intervals, cumulative_totals, metric_label)
 
+    root.mainloop()
+
+
+def show_summary_table(
+    rows: list[SummaryRow],
+    years: list[str],
+    underlying: str | None,
+    date_filter: tuple[datetime, datetime] | None,
+) -> None:
+    root = tk.Tk()
+    suffix = f" - {underlying}" if underlying else ""
+    label = date_filter_label(years, date_filter)
+    root.title(f"PnL Summary {label}{suffix}")
+    root.geometry("1250x760")
+
+    title = tk.Label(
+        root,
+        text=f"PnL Summary ({label}){suffix}",
+        anchor="w",
+        padx=10,
+        pady=8,
+        font=("Arial", 12, "bold"),
+    )
+    title.pack(fill="x")
+
+    frame = tk.Frame(root)
+    frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+    canvas = tk.Canvas(frame, highlightthickness=0)
+    table = tk.Frame(canvas)
+    y_scroll = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
+    x_scroll = ttk.Scrollbar(frame, orient="horizontal", command=canvas.xview)
+    canvas.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+    canvas.create_window((0, 0), window=table, anchor="nw")
+    table.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
+    canvas.grid(row=0, column=0, sticky="nsew")
+    y_scroll.grid(row=0, column=1, sticky="ns")
+    x_scroll.grid(row=1, column=0, sticky="ew")
+    frame.grid_rowconfigure(0, weight=1)
+    frame.grid_columnconfigure(0, weight=1)
+
+    headers = [
+        "Date",
+        "Underlying",
+        "Frozen IV PnL",
+        "Total PnL",
+        "Gamma Diff PnL",
+        "Full Spot Vol",
+        "Full UM Mid Vol",
+        "Frozen Closest Strike Avg IV",
+    ]
+    for column_index, header in enumerate(headers):
+        add_cell(
+            table,
+            0,
+            column_index,
+            header,
+            bg="#e5e7eb",
+            bold=True,
+            anchor="center",
+        )
+
+    for row_index, row in enumerate(rows, start=1):
+        values = [
+            format_date(row.date_key),
+            row.underlying,
+            format_summary_number(row.frozen_iv_pnl),
+            format_summary_number(row.total_pnl),
+            format_summary_number(row.gamma_diff_pnl),
+            format_percent_value(row.full_spot_vol),
+            format_percent_value(row.full_um_mid_vol),
+            format_plain_percent_value(row.frozen_closest_strike_avg_vol),
+        ]
+        for column_index, value in enumerate(values):
+            add_cell(
+                table,
+                row_index,
+                column_index,
+                value,
+                fg=summary_fg(row, column_index),
+                anchor="center" if column_index < 2 else "e",
+            )
+
+    total_row = len(rows) + 1
+    add_cell(table, total_row, 0, "Total", bg="#dbeafe", bold=True, anchor="center")
+    add_cell(table, total_row, 1, "", bg="#dbeafe", bold=True, anchor="center")
+    add_cell(table, total_row, 2, format_summary_number(sum_optional(row.frozen_iv_pnl for row in rows)), bg="#dbeafe", bold=True)
+    add_cell(table, total_row, 3, format_summary_number(sum_optional(row.total_pnl for row in rows)), bg="#dbeafe", bold=True)
+    add_cell(table, total_row, 4, format_summary_number(sum_optional(row.gamma_diff_pnl for row in rows)), bg="#dbeafe", bold=True)
+    add_cell(table, total_row, 5, format_percent_value(avg_optional(row.full_spot_vol for row in rows)), bg="#dbeafe", bold=True)
+    add_cell(table, total_row, 6, format_percent_value(avg_optional(row.full_um_mid_vol for row in rows)), bg="#dbeafe", bold=True)
+    add_cell(table, total_row, 7, format_plain_percent_value(avg_optional(row.frozen_closest_strike_avg_vol for row in rows)), bg="#dbeafe", bold=True)
+
+    canvas.bind_all("<MouseWheel>", lambda event: canvas.yview_scroll(int(-1 * (event.delta / 120)), "units"))
     root.mainloop()
 
 
@@ -225,6 +452,7 @@ def build_chart_tab(
     intervals: list[str],
     totals: list[float],
     medians: list[float],
+    metric_label: str,
 ) -> None:
     canvas = tk.Canvas(parent, bg="white", highlightthickness=0)
     x_scroll = ttk.Scrollbar(parent, orient="horizontal", command=canvas.xview)
@@ -234,13 +462,18 @@ def build_chart_tab(
 
     def redraw(_event: tk.Event | None = None) -> None:
         canvas.delete("all")
-        draw_bar_chart(canvas, intervals, totals, medians)
+        draw_bar_chart(canvas, intervals, totals, medians, metric_label)
 
     canvas.bind("<Configure>", redraw)
     redraw()
 
 
-def build_cumulative_chart_tab(parent: tk.Frame, intervals: list[str], values: list[float]) -> None:
+def build_cumulative_chart_tab(
+    parent: tk.Frame,
+    intervals: list[str],
+    values: list[float],
+    metric_label: str,
+) -> None:
     canvas = tk.Canvas(parent, bg="white", highlightthickness=0)
     x_scroll = ttk.Scrollbar(parent, orient="horizontal", command=canvas.xview)
     canvas.configure(xscrollcommand=x_scroll.set)
@@ -253,7 +486,7 @@ def build_cumulative_chart_tab(parent: tk.Frame, intervals: list[str], values: l
             canvas,
             intervals,
             values,
-            f"Cumulative Total PnL Using {INTERVAL_MINUTES}-Minute Buckets",
+            f"Cumulative {metric_label} Using {INTERVAL_MINUTES}-Minute Buckets",
         )
 
     canvas.bind("<Configure>", redraw)
@@ -265,6 +498,7 @@ def draw_bar_chart(
     intervals: list[str],
     totals: list[float],
     medians: list[float],
+    metric_label: str,
 ) -> None:
     if not intervals:
         return
@@ -287,7 +521,7 @@ def draw_bar_chart(
     canvas.create_text(
         margin_left,
         16,
-        text=f"Total PnL by {INTERVAL_MINUTES}-Minute Interval    Blue marker = median",
+        text=f"{metric_label} by {INTERVAL_MINUTES}-Minute Interval    Blue marker = median",
         anchor="w",
         font=("Arial", 12, "bold"),
         fill="#111827",
@@ -505,15 +739,182 @@ def parse_float(value: str | None) -> float | None:
         return None
 
 
+def metric_value(record: dict[str, str], fields: tuple[str, ...]) -> float | None:
+    values = [parse_float(record.get(field)) for field in fields]
+    if any(value is None for value in values):
+        return None
+    return sum(value for value in values if value is not None)
+
+
+def last_float(
+    records: list[dict[str, str]],
+    field: str,
+    default: float | None = None,
+) -> float | None:
+    for record in reversed(records):
+        value = parse_float(record.get(field))
+        if value is not None:
+            return value
+    return default
+
+
+def closest_strike_average_iv(
+    records: list[dict[str, str]],
+    closest_strikes: int,
+) -> float | None:
+    if closest_strikes <= 0:
+        return None
+    record = next_record_at_or_after(records, START_TIME)
+    if record is None:
+        return None
+    universal_mid = parse_float(record.get("universal_mid"))
+    if universal_mid is None:
+        return None
+
+    ivs_by_strike = []
+    for field, value in record.items():
+        strike = strike_from_model_iv_field(field)
+        if strike is None:
+            continue
+        iv = parse_float(value)
+        if iv is None:
+            continue
+        ivs_by_strike.append((abs(strike - universal_mid), strike, iv))
+    if not ivs_by_strike:
+        return None
+
+    closest = sorted(ivs_by_strike)[:closest_strikes]
+    return sum(iv for _, _, iv in closest) / len(closest)
+
+
+def next_record_at_or_after(
+    records: list[dict[str, str]],
+    target_time: str,
+) -> dict[str, str] | None:
+    for record in records:
+        timestamp = record.get("timestamp", "")
+        if len(timestamp) >= 16 and timestamp[11:16] >= target_time:
+            return record
+    return None
+
+
+def strike_from_model_iv_field(field: str) -> int | None:
+    prefix = "strike_"
+    suffix = "_model_iv"
+    if not field.startswith(prefix) or not field.endswith(suffix):
+        return None
+    try:
+        return int(field[len(prefix) : -len(suffix)])
+    except ValueError:
+        return None
+
+
+def sum_optional(values) -> float | None:
+    numeric_values = [value for value in values if value is not None]
+    return sum(numeric_values) if numeric_values else None
+
+
+def avg_optional(values) -> float | None:
+    numeric_values = [value for value in values if value is not None]
+    return sum(numeric_values) / len(numeric_values) if numeric_values else None
+
+
+def parse_years(value: str) -> list[str]:
+    years = [part.strip() for part in value.split(",") if part.strip()]
+    return years or ["2026"]
+
+
+def years_for_filter(
+    year_value: str,
+    date_filter: tuple[datetime, datetime] | None,
+) -> list[str]:
+    if date_filter is None:
+        return parse_years(year_value)
+    start, end = date_filter
+    return [str(year) for year in range(start.year, end.year + 1)]
+
+
+def parse_date_filter(
+    start_date: str | None,
+    end_date: str | None,
+) -> tuple[datetime, datetime] | None:
+    if not start_date and not end_date:
+        return None
+    if not start_date or not end_date:
+        raise SystemExit("Use both --start-date and --end-date.")
+    start = parse_date_key(start_date)
+    end = parse_date_key(end_date)
+    if end < start:
+        raise SystemExit("--end-date must be on or after --start-date.")
+    return start, end
+
+
+def parse_date_key(value: str) -> datetime:
+    text = value.strip()
+    for fmt in ("%d%m%Y", "%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    raise SystemExit(f"Could not parse date {value!r}. Use DDMMYYYY or YYYY-MM-DD.")
+
+
+def path_in_date_filter(path: Path, date_filter: tuple[datetime, datetime] | None) -> bool:
+    if date_filter is None:
+        return True
+    try:
+        value = datetime.strptime(path.stem[:8], "%Y%m%d")
+    except ValueError:
+        return False
+    start, end = date_filter
+    return start <= value <= end
+
+
+def date_filter_label(
+    years: list[str],
+    date_filter: tuple[datetime, datetime] | None,
+) -> str:
+    if date_filter is None:
+        return ", ".join(years)
+    start, end = date_filter
+    return f"{start:%d%b%y}-{end:%d%b%y}"
+
+
 def format_value(value: float | None) -> str:
     return "" if value is None else f"{value:.0f}"
 
 
+def format_summary_number(value: float | None) -> str:
+    return "" if value is None else f"{value:.2f}"
+
+
+def format_percent_value(value: float | None) -> str:
+    return "" if value is None else f"{value * 100:.2f}%"
+
+
+def format_plain_percent_value(value: float | None) -> str:
+    return "" if value is None else f"{value:.2f}%"
+
+
+def summary_fg(row: SummaryRow, column_index: int) -> str:
+    values = {
+        2: row.frozen_iv_pnl,
+        3: row.total_pnl,
+        4: row.gamma_diff_pnl,
+    }
+    value = values.get(column_index)
+    return "#b91c1c" if value is not None and value < 0 else "#111827"
+
+
 def format_date(date_key: str) -> str:
     try:
-        return datetime.strptime(date_key, "%Y%m%d").strftime("%d%b%y")
+        return datetime.strptime(date_key[:8], "%Y%m%d").strftime("%d%b%y")
     except ValueError:
         return date_key
+
+
+def date_key_for_sort(value: str) -> str:
+    return value[:8]
 
 
 def add_value_cell(

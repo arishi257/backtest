@@ -81,7 +81,7 @@ class ProcessedDataWriter:
         if result is None:
             return
 
-        path = self.path_for(timestamp)
+        path = self.path_for(timestamp, session)
         minute_key = timestamp.strftime("%Y-%m-%d %H:%M")
         write_key = (path, minute_key)
         if write_key in self.last_written_minute:
@@ -111,8 +111,8 @@ class ProcessedDataWriter:
             )
         self.last_written_minute.add(write_key)
 
-    def path_for(self, timestamp: datetime) -> Path:
-        return self.output_dir / f"{timestamp:%Y%m%d}.csv"
+    def path_for(self, timestamp: datetime, session: ExpirySession) -> Path:
+        return self.output_dir / f"{timestamp:%Y%m%d}_{session.spec.underlying}.csv"
 
 
 def processed_columns(sessions: list[ExpirySession]) -> list[str]:

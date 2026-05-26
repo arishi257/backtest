@@ -2,11 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime
+from io import BytesIO
 from pathlib import Path
 import subprocess
 from zoneinfo import ZoneInfo
+from zipfile import ZipFile
 
 import pandas as pd
+
+from backtest.config import options_data_root
 
 
 SPOT_DATA_ROOT = Path.home() / "OneDrive" / "spot data"
@@ -81,6 +85,10 @@ def spot_file_path(trade_date: date, underlying: str, data_root: Path) -> Path:
 
 
 def load_sensex_index_series(trade_date: date) -> SpotSeries:
+    zip_series = load_sensex_ohlc_zip_spot_series(trade_date)
+    if zip_series is not None:
+        return zip_series
+
     archive = sensex_index_archive(trade_date)
     if archive is None:
         raise FileNotFoundError(f"Could not find SENSEX index archive for {trade_date:%Y-%m-%d}.")
@@ -112,6 +120,48 @@ def load_sensex_index_series(trade_date: date) -> SpotSeries:
         raise ValueError(f"No SENSEX index rows found for {trade_date:%Y-%m-%d} in {archive}.")
     points = sorted(dict(points).items())
     return SpotSeries("SENSEX", trade_date, archive, points)
+
+
+def load_sensex_ohlc_zip_spot_series(trade_date: date) -> SpotSeries | None:
+    archive = find_sensex_ohlc_zip()
+    if archive is None:
+        return None
+
+    with ZipFile(archive) as zipped:
+        member = next(
+            (
+                name
+                for name in zipped.namelist()
+                if Path(name).name.lower() == "sensex_spot_2024_2025.csv"
+            ),
+            None,
+        )
+        if member is None:
+            return None
+        frame = pd.read_csv(BytesIO(zipped.read(member)))
+
+    frame["timestamp"] = pd.to_datetime(frame["Datetime"])
+    frame = frame[frame["timestamp"].dt.date == trade_date].copy()
+    if frame.empty:
+        return None
+
+    frame["close"] = pd.to_numeric(frame["Close"], errors="coerce")
+    frame = frame.dropna(subset=["close"])
+    frame["timestamp"] = frame["timestamp"].dt.tz_localize(IST).dt.floor("min")
+    frame = frame.sort_values("timestamp").drop_duplicates("timestamp", keep="last")
+    points = [
+        (row.timestamp.to_pydatetime(), float(row.close))
+        for row in frame[["timestamp", "close"]].itertuples(index=False)
+    ]
+    if not points:
+        return None
+    return SpotSeries("SENSEX", trade_date, archive, points)
+
+
+def find_sensex_ohlc_zip() -> Path | None:
+    root = options_data_root("SENSEX")
+    candidates = sorted(root.glob("*SENSEX_OHLC*.zip"))
+    return candidates[0] if candidates else None
 
 
 def sensex_index_archive(trade_date: date) -> Path | None:

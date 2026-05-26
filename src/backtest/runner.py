@@ -12,6 +12,11 @@ from backtest.config import (
     resolve_sample_csv,
 )
 from backtest.data import load_option_dataset
+from backtest.headless_portfolio import (
+    GammaDiffTracker,
+    HeadlessFrozenIvState,
+    HeadlessPortfolioState,
+)
 from backtest.processed_data import ProcessedDataWriter
 from backtest.replay import CsvReplayFeed, register_token_tickers
 from backtest.sessions import build_backtest_sessions
@@ -49,6 +54,12 @@ def main() -> None:
         default=None,
         help="Milliseconds between replay slices, e.g. 100 for faster playback.",
     )
+    parser.add_argument(
+        "--hedge-threshold",
+        type=float,
+        default=1.3,
+        help="BS delta lots threshold for re-hedging.",
+    )
     args = parser.parse_args()
 
     csv_path = resolve_sample_csv(args.date, args.csv, args.underlying)
@@ -70,7 +81,16 @@ def main() -> None:
     register_token_tickers(sessions, dataset)
     writer = SnapshotWriter(args.output_dir)
     processed_writer = ProcessedDataWriter(args.processed_output_dir, sessions)
-    universal_mid_points = []
+    universal_mid_points = {session.spec.tab_name: [] for session in sessions}
+    portfolio_states = {
+        session.spec.tab_name: HeadlessPortfolioState(session=session)
+        for session in sessions
+    }
+    frozen_states = {
+        session.spec.tab_name: HeadlessFrozenIvState(session)
+        for session in sessions
+    }
+    gamma_trackers = {session.spec.tab_name: GammaDiffTracker() for session in sessions}
 
     cycles = 0
     analytics = 0
@@ -82,13 +102,36 @@ def main() -> None:
                 continue
             analytics += 1
             writer.maybe_write(replay.now(), session, result)
-            universal_mid_points.append((replay.now(), result.universal_mid))
+            tab_name = session.spec.tab_name
+            universal_mid_points[tab_name].append((replay.now(), result.universal_mid))
+            portfolio_metrics = portfolio_states[tab_name].update(
+                result,
+                replay.now(),
+                session.config.market.funding_rate,
+                session.config.market.brokerage_rate,
+                args.hedge_threshold,
+            )
+            frozen_metrics = frozen_states[tab_name].update(
+                result,
+                replay.now(),
+                session.config.market.funding_rate,
+                session.config.market.brokerage_rate,
+                args.hedge_threshold,
+            )
+            gamma_diff_total = gamma_trackers[tab_name].update(
+                replay.now(),
+                result.universal_mid,
+                portfolio_metrics.gamma_l,
+            )
             processed_writer.write(
                 replay.now(),
                 session,
                 result,
                 spot_points,
-                universal_mid_points,
+                universal_mid_points[tab_name],
+                portfolio_metrics.total_pnl,
+                gamma_diff_total,
+                frozen_metrics.total_pnl,
             )
 
     print(

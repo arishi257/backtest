@@ -16,6 +16,12 @@ SAMPLE_DATA_ROOT = Path(
         str(Path.home() / "OneDrive" / "Options data"),
     )
 )
+NIFTY_DATA_ROOT = Path(
+    os.environ.get(
+        "BACKTEST_NIFTY_DATA_ROOT",
+        r"C:\options data",
+    )
+)
 EXTRACTED_DATA_DIR = PROJECT_ROOT / ".backtest_data_cache"
 DEFAULT_FILE_DATE = "09042026"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "backtest_snapshots"
@@ -37,7 +43,17 @@ def normalize_underlying(value: str) -> str:
 
 
 def options_data_root(underlying: str) -> Path:
-    return SAMPLE_DATA_ROOT / ("BFO" if normalize_underlying(underlying) == "SENSEX" else "NFO")
+    if normalize_underlying(underlying) == "NIFTY":
+        return NIFTY_DATA_ROOT
+    return SAMPLE_DATA_ROOT / "BFO"
+
+
+def nfo_data_roots() -> list[Path]:
+    roots = [options_data_root("NIFTY")]
+    for root in (SAMPLE_DATA_ROOT / "NFO", SAMPLE_DATA_ROOT):
+        if root not in roots:
+            roots.append(root)
+    return roots
 
 
 def resolve_sample_csv(
@@ -52,9 +68,14 @@ def resolve_sample_csv(
     normalized_underlying = normalize_underlying(underlying)
     csv_path = find_sample_csv(date_key, normalized_underlying)
     if csv_path is None:
+        searched_roots = (
+            nfo_data_roots()
+            if normalized_underlying == "NIFTY"
+            else [options_data_root(normalized_underlying)]
+        )
         raise FileNotFoundError(
             f"Could not find {normalized_underlying} option data ending with {date_key} "
-            f"under {options_data_root(normalized_underlying)}."
+            f"under {', '.join(str(root) for root in searched_roots)}."
         )
     return csv_path
 
@@ -67,16 +88,36 @@ def find_sample_csv(date_key: str, underlying: str = DEFAULT_UNDERLYING) -> Path
 
 def find_nfo_sample_csv(date_key: str) -> Path | None:
     csv_name = f"GFDLNFO_BACKADJUSTED_{date_key}.csv"
-    root = options_data_root("NIFTY")
+    cached_csv = EXTRACTED_DATA_DIR / csv_name
+    if cached_csv.exists():
+        return cached_csv
 
+    roots = [root for root in nfo_data_roots() if root.exists()]
+    for root in roots:
+        extracted = extract_nfo_candidate_archive(date_key, csv_name, root)
+        if extracted is not None:
+            return extracted
+    for root in roots:
+        loose_match = find_loose_nfo_csv(date_key, csv_name, root)
+        if loose_match is not None:
+            return loose_match
+    for root in roots:
+        extracted = extract_nfo_from_any_zip(date_key, csv_name, root)
+        if extracted is not None:
+            return extracted
+    return None
+
+
+def find_loose_nfo_csv(date_key: str, csv_name: str, root: Path) -> Path | None:
     loose_matches = sorted(
         path
         for path in root.rglob(f"*{date_key}.csv")
         if path.name == csv_name or path.stem.endswith(date_key)
     )
-    if loose_matches:
-        return loose_matches[0]
+    return loose_matches[0] if loose_matches else None
 
+
+def extract_nfo_candidate_archive(date_key: str, csv_name: str, root: Path) -> Path | None:
     for monthly_zip in candidate_archive_paths(date_key, root):
         if not monthly_zip.exists():
             continue
@@ -88,9 +129,13 @@ def find_nfo_sample_csv(date_key: str) -> Path | None:
         extracted = extract_daily_csv(monthly_zip, csv_name)
         if extracted is not None:
             return extracted
+    return None
 
+
+def extract_nfo_from_any_zip(date_key: str, csv_name: str, root: Path) -> Path | None:
+    monthly_zips = candidate_archive_paths(date_key, root)
     for zip_path in sorted(root.rglob("*.zip")):
-        if zip_path in candidate_archive_paths(date_key, root):
+        if zip_path in monthly_zips:
             continue
         extracted = extract_nested_daily_csv(zip_path, date_key, csv_name)
         if extracted is not None:
@@ -119,6 +164,10 @@ def find_bfo_sample_csv(date_key: str) -> Path | None:
     if output_path.exists():
         return output_path
 
+    extracted = extract_bfo_ohlc_zip_csv(date_key, output_path)
+    if extracted is not None:
+        return extracted
+
     rar_path = find_bfo_option_archive(date_key)
     if rar_path is None:
         return None
@@ -133,6 +182,44 @@ def find_bfo_sample_csv(date_key: str) -> Path | None:
         for ticker, date_text, time_text, close in rows:
             file.write(f"{ticker},{date_text},{time_text},{close}\n")
     return output_path
+
+
+def extract_bfo_ohlc_zip_csv(date_key: str, output_path: Path) -> Path | None:
+    archive = find_bfo_ohlc_zip()
+    if archive is None:
+        return None
+
+    trade_date = datetime.strptime(date_key, "%d%m%Y")
+    member_basename = f"{trade_date:%Y-%m-%d}_OPT.csv"
+    with ZipFile(archive) as zipped:
+        member = next(
+            (
+                name
+                for name in zipped.namelist()
+                if Path(name).name == member_basename
+            ),
+            None,
+        )
+        if member is None:
+            return None
+
+        EXTRACTED_DATA_DIR.mkdir(exist_ok=True)
+        text = zipped.read(member).decode("utf-8-sig")
+
+    with output_path.open("w", newline="") as file:
+        file.write("Ticker,Date,Time,Close\n")
+        for line in text.splitlines()[1:]:
+            parts = [part.strip() for part in line.split(",")]
+            if len(parts) < 12 or parts[8].upper() != "SENSEX":
+                continue
+            file.write(f"{parts[7]},{trade_date:%Y-%m-%d},{parts[0]},{parts[4]}\n")
+    return output_path
+
+
+def find_bfo_ohlc_zip() -> Path | None:
+    root = options_data_root("SENSEX")
+    candidates = sorted(root.glob("*SENSEX_OHLC*.zip"))
+    return candidates[0] if candidates else None
 
 
 def find_bfo_option_archive(date_key: str) -> Path | None:
@@ -223,14 +310,16 @@ def extract_nested_daily_csv(monthly_zip: Path, date_key: str, csv_name: str) ->
 
 def extract_daily_csv(zip_path: Path, csv_name: str) -> Path | None:
     with ZipFile(zip_path) as archive:
-        if csv_name in (Path(name).name for name in archive.namelist()):
+        csv_name_lower = csv_name.lower()
+        if csv_name_lower in (Path(name).name.lower() for name in archive.namelist()):
             return extract_csv_member(archive, csv_name)
     return None
 
 
 def extract_csv_member(archive: ZipFile, csv_name: str) -> Path | None:
+    csv_name_lower = csv_name.lower()
     member_name = next(
-        (name for name in archive.namelist() if Path(name).name == csv_name),
+        (name for name in archive.namelist() if Path(name).name.lower() == csv_name_lower),
         None,
     )
     if member_name is None:
