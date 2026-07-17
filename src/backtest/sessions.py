@@ -14,7 +14,7 @@ from fit_sensex.config import ApiConfig, StrikeConfig, build_app_config
 from fit_sensex.market.instruments import build_option_chain
 from fit_sensex.market.kite_stream import MarketDataStore
 from fit_sensex.services.analytics import AnalyticsEngine
-from fit_sensex.services.expiry_calendar import load_full_days_for_expiry, load_model_params
+from fit_sensex.services.expiry_calendar import load_model_params
 from vol_dashboard.models import ExpirySession, ExpirySpec
 
 
@@ -70,10 +70,7 @@ def build_backtest_config(
         else:
             os.environ["HOLIDAYS_FILE"] = previous
 
-    try:
-        full_days = load_full_days_for_expiry(workbook_path, expiry, dataset.underlying)
-    except (FileNotFoundError, ValueError):
-        full_days = business_days_until_expiry(trade_date, expiry)
+    full_days = business_days_until_expiry(trade_date, expiry)
 
     try:
         model_params = load_model_params(workbook_path, dataset.underlying)

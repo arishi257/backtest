@@ -2,3 +2,6 @@
 processed_data/
 __pycache__/
 *.py[cod]
+snapshots/
+portfolio_*.csv
+hols.xlsx
