@@ -14,6 +14,12 @@ from matplotlib.figure import Figure
 
 from vol_dashboard import compat  # noqa: F401
 from backtest.config import DEFAULT_PROCESSED_OUTPUT_DIR
+from backtest.data import FutureSeries
+from backtest.headless_portfolio import (
+    GAMMA_MOVE_STEP,
+    ParkGammaMetrics,
+    ParkGammaTracker,
+)
 from backtest.portfolio import SamplePortfolioRisk, build_sample_portfolio
 from backtest.processed_data import ProcessedDataWriter
 from fit_sensex.models import AnalyticsResult
@@ -58,6 +64,7 @@ class VolDashboardApp:
         spot_store: SpotStore | None = None,
         spot_points: list[tuple[datetime, float]] | None = None,
         spot_source: str | None = None,
+        future_series: FutureSeries | None = None,
         processed_output_dir: Path = DEFAULT_PROCESSED_OUTPUT_DIR,
         before_refresh: Callable[[], bool] | None = None,
         clock: Callable[[], datetime] | None = None,
@@ -68,6 +75,8 @@ class VolDashboardApp:
         self.spot_store = spot_store
         self.spot_points = spot_points or []
         self.spot_source = spot_source
+        self.future_series = future_series
+        self.park_gamma_tracker = ParkGammaTracker()
         self.before_refresh = before_refresh
         self.clock = clock or (lambda: datetime.now(ZoneInfo("Asia/Kolkata")))
         self.auto_schedule = auto_schedule
@@ -94,6 +103,7 @@ class VolDashboardApp:
         self.snapshot_rows_by_tab: dict[str, dict[str, dict[str, str]]] = {}
         self.last_live_timestamp: datetime | None = None
         self.portfolio_risk: SamplePortfolioRisk | None = None
+        self.latest_park_gamma_metrics = ParkGammaMetrics()
 
         self.root.title("Multi-Expiry Vol Dashboard")
         self.root.geometry("1320x820")
@@ -493,6 +503,15 @@ class VolDashboardApp:
             intraday_var,
         )
         self._refresh_portfolio_risk(full_day_spot_vol, full_day_mid_vol)
+        future_bar = (
+            self.future_series.bar_at(snapshot_timestamp)
+            if self.future_series is not None
+            else None
+        )
+        self.latest_park_gamma_metrics = self.park_gamma_tracker.update(
+            future_bar,
+            self.portfolio_tab.last_gamma_l,
+        )
         if nearest_session is not None and nearest_result is not None:
             self.processed_writer.write(
                 snapshot_timestamp,
@@ -501,8 +520,10 @@ class VolDashboardApp:
                 self.spot_points,
                 self.spot_time_tab.universal_mid_points,
                 self.portfolio_tab.last_total_pnl,
+                self.portfolio_tab.last_gamma_l,
                 self.spot_time_tab.gamma_diff_total(),
                 self.frozen_iv_tab.last_total_pnl,
+                self.latest_park_gamma_metrics,
             )
         self.spot_time_tab.render(
             snapshot_timestamp,
@@ -513,6 +534,8 @@ class VolDashboardApp:
             self.portfolio_tab.last_total_pnl,
             self.portfolio_tab.last_gamma_l,
             self.frozen_iv_tab.last_total_pnl,
+            self.latest_park_gamma_metrics.park_gamma_pnl_diff_total,
+            self.latest_park_gamma_metrics.gk_gamma_pnl_diff_total,
         )
         self._render_spot_rows(spot_by_underlying)
         self._render_skew_lock_table()
@@ -1205,7 +1228,7 @@ class SpotTimeTab:
                 wraplength=1100,
             ).grid(row=row_index, column=1, sticky="ew")
         metrics.grid_columnconfigure(1, weight=1)
-        moves_frame = tk.LabelFrame(top_row, text="Universal Mid Moves > 0.10%")
+        moves_frame = tk.LabelFrame(top_row, text="Universal Mid Moves > 0.20%")
         moves_frame.pack(side="right", fill="y", padx=(8, 0))
         self._build_top_moves_panel(moves_frame)
 
@@ -1226,6 +1249,8 @@ class SpotTimeTab:
         total_pnl: float | None = None,
         gamma_l: float | None = None,
         frozen_iv_total_pnl: float | None = None,
+        park_gamma_pnl_diff_total: float | None = None,
+        gk_gamma_pnl_diff_total: float | None = None,
     ) -> None:
         if self.vol_ax is None or self.pnl_ax is None or self.vol_canvas is None:
             return
@@ -1256,6 +1281,8 @@ class SpotTimeTab:
                 full_day_vol_mid=None,
                 total_pnl=total_pnl,
                 gamma_diff_total=self.gamma_diff_total(),
+                park_gamma_pnl_diff_total=park_gamma_pnl_diff_total,
+                gk_gamma_pnl_diff_total=gk_gamma_pnl_diff_total,
                 frozen_iv_total_pnl=frozen_iv_total_pnl,
                 spot_rows=0,
                 source="No spot or universal mid data loaded for this replay date",
@@ -1305,6 +1332,8 @@ class SpotTimeTab:
             full_day_vol_mid=full_day_vol_mid,
             total_pnl=total_pnl,
             gamma_diff_total=self.gamma_diff_total(),
+            park_gamma_pnl_diff_total=park_gamma_pnl_diff_total,
+            gk_gamma_pnl_diff_total=gk_gamma_pnl_diff_total,
             frozen_iv_total_pnl=frozen_iv_total_pnl,
             spot_rows=len(self.points),
             source=self.source,
@@ -1324,6 +1353,8 @@ class SpotTimeTab:
         full_day_vol_mid: float | None,
         total_pnl: float | None,
         gamma_diff_total: float | None,
+        park_gamma_pnl_diff_total: float | None,
+        gk_gamma_pnl_diff_total: float | None,
         frozen_iv_total_pnl: float | None,
         spot_rows: int,
         source: str | None,
@@ -1352,9 +1383,11 @@ class SpotTimeTab:
             format_number(total_pnl, 2) if total_pnl is not None else "--"
         )
         self.metric_vars["Gamma Diff Total"].set(
-            format_number(gamma_diff_total, 2)
-            if gamma_diff_total is not None
-            else "--"
+            format_gamma_totals(
+                gamma_diff_total,
+                park_gamma_pnl_diff_total,
+                gk_gamma_pnl_diff_total,
+            )
         )
         self.metric_vars["Frozen IV Total PnL"].set(
             format_number(frozen_iv_total_pnl, 2)
@@ -1587,7 +1620,7 @@ class SpotTimeTab:
                 continue
             move_return = mid / previous_mid - 1
             move_pct = move_return * 100
-            if abs(move_return) <= 0.001:
+            if abs(move_return) <= GAMMA_MOVE_STEP:
                 continue
             previous_pnl = pnl_by_timestamp.get(previous_time)
             total_pnl = pnl_by_timestamp.get(timestamp)
@@ -2988,7 +3021,7 @@ def is_top_move_time(timestamp: datetime) -> bool:
 def capped_gamma_pnl_for_move(gamma_l: float, move_return: float) -> float:
     remaining_move = abs(move_return)
     capped_pnl = 0.0
-    max_chunk = 0.001
+    max_chunk = GAMMA_MOVE_STEP
     while remaining_move > 0:
         chunk = min(max_chunk, remaining_move)
         capped_pnl += 0.5 * (gamma_l * 100000 * 10) * chunk * chunk * 100 / 1000
@@ -3266,6 +3299,25 @@ def format_percent_or_dash(value) -> str:
 
 def format_vol_pair(running_vol, full_day_vol) -> str:
     return f"{format_percent_or_dash(running_vol)}    ||    {format_percent_or_dash(full_day_vol)}"
+
+
+def format_gamma_totals(
+    gamma_diff_total,
+    park_gamma_pnl_diff_total,
+    gk_gamma_pnl_diff_total,
+) -> str:
+    left = format_number(gamma_diff_total, 2) if gamma_diff_total is not None else "--"
+    hf = (
+        format_number(park_gamma_pnl_diff_total, 2)
+        if park_gamma_pnl_diff_total is not None
+        else "--"
+    )
+    gk = (
+        format_number(gk_gamma_pnl_diff_total, 2)
+        if gk_gamma_pnl_diff_total is not None
+        else "--"
+    )
+    return f"{left}  ||  {hf}  ||  {gk}"
 
 
 def format_vol(value) -> str:

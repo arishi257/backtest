@@ -52,6 +52,9 @@ def main() -> None:
 
     csv_path = resolve_sample_csv(args.date, args.csv, args.underlying)
     dataset = load_option_dataset(csv_path, args.underlying)
+    future_series = dataset.future_series
+    if future_series is None:
+        print("Nearest futures data unavailable.")
     spot_points = []
     spot_source = None
     try:
@@ -91,6 +94,7 @@ def main() -> None:
         spot_store=SpotStore(),
         spot_points=spot_points,
         spot_source=spot_source,
+        future_series=future_series,
         processed_output_dir=args.processed_output_dir,
         before_refresh=replay.advance,
         clock=replay.now,

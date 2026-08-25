@@ -10,7 +10,7 @@ from zipfile import ZipFile
 
 import pandas as pd
 
-from backtest.config import options_data_root
+from backtest.config import EXTRACTED_DATA_DIR, options_data_root
 
 
 SPOT_DATA_ROOT = Path.home() / "OneDrive" / "spot data"
@@ -23,6 +23,14 @@ class SpotSeries:
     trade_date: date
     source_path: Path
     points: list[tuple[datetime, float]]
+
+
+@dataclass(frozen=True)
+class SpotOhlcSeries:
+    underlying: str
+    trade_date: date
+    source_path: Path
+    frame: pd.DataFrame
 
 
 def load_spot_series(
@@ -85,8 +93,22 @@ def spot_file_path(trade_date: date, underlying: str, data_root: Path) -> Path:
 
 
 def load_sensex_index_series(trade_date: date) -> SpotSeries:
+    ohlc_series = load_sensex_index_ohlc_series(trade_date)
+    points = [
+        (row.timestamp.to_pydatetime(), float(row.close))
+        for row in ohlc_series.frame[["timestamp", "close"]].itertuples(index=False)
+    ]
+    return SpotSeries("SENSEX", trade_date, ohlc_series.source_path, points)
+
+
+def load_sensex_index_ohlc_series(trade_date: date) -> SpotOhlcSeries:
+    cache_path = sensex_ohlc_cache_path(trade_date)
+    if cache_path.exists():
+        return load_cached_sensex_index_ohlc_series(trade_date, cache_path)
+
     zip_series = load_sensex_ohlc_zip_spot_series(trade_date)
     if zip_series is not None:
+        write_sensex_index_ohlc_cache(zip_series.frame, cache_path)
         return zip_series
 
     archive = sensex_index_archive(trade_date)
@@ -106,7 +128,7 @@ def load_sensex_index_series(trade_date: date) -> SpotSeries:
 
     text = rar_member_text(archive, member)
     bfo_date_text = trade_date.strftime("%m/%d/%Y")
-    points = []
+    rows = []
     for line in text.splitlines()[1:]:
         parts = [part.strip() for part in line.split(",")]
         if len(parts) < 7 or parts[1] != bfo_date_text:
@@ -115,14 +137,49 @@ def load_sensex_index_series(trade_date: date) -> SpotSeries:
             f"{parts[1]} {parts[2]}",
             "%m/%d/%Y %H:%M:%S",
         ).replace(tzinfo=IST)
-        points.append((timestamp.replace(second=0, microsecond=0), float(parts[6])))
-    if not points:
+        rows.append(
+            {
+                "timestamp": timestamp.replace(second=0, microsecond=0),
+                "open": float(parts[3]),
+                "high": float(parts[4]),
+                "low": float(parts[5]),
+                "close": float(parts[6]),
+            }
+        )
+    if not rows:
         raise ValueError(f"No SENSEX index rows found for {trade_date:%Y-%m-%d} in {archive}.")
-    points = sorted(dict(points).items())
-    return SpotSeries("SENSEX", trade_date, archive, points)
+    frame = pd.DataFrame(rows).sort_values("timestamp").drop_duplicates("timestamp", keep="last")
+    write_sensex_index_ohlc_cache(frame, cache_path)
+    return SpotOhlcSeries("SENSEX", trade_date, archive, frame)
 
 
-def load_sensex_ohlc_zip_spot_series(trade_date: date) -> SpotSeries | None:
+def sensex_ohlc_cache_path(trade_date: date) -> Path:
+    return EXTRACTED_DATA_DIR / f"SENSEX_INDEX_OHLC_{trade_date:%d%m%Y}.csv"
+
+
+def load_cached_sensex_index_ohlc_series(
+    trade_date: date,
+    cache_path: Path,
+) -> SpotOhlcSeries:
+    frame = pd.read_csv(cache_path)
+    frame["timestamp"] = pd.to_datetime(frame["timestamp"]).dt.tz_convert(IST)
+    for column in ("open", "high", "low", "close"):
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame = frame.dropna(subset=["open", "high", "low", "close"])
+    frame = frame.sort_values("timestamp").drop_duplicates("timestamp", keep="last")
+    frame = frame[["timestamp", "open", "high", "low", "close"]]
+    if frame.empty:
+        raise ValueError(f"No SENSEX index OHLC rows found in cache {cache_path}.")
+    return SpotOhlcSeries("SENSEX", trade_date, cache_path, frame)
+
+
+def write_sensex_index_ohlc_cache(frame: pd.DataFrame, cache_path: Path) -> None:
+    EXTRACTED_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    output = frame[["timestamp", "open", "high", "low", "close"]].copy()
+    output.to_csv(cache_path, index=False)
+
+
+def load_sensex_ohlc_zip_spot_series(trade_date: date) -> SpotOhlcSeries | None:
     archive = find_sensex_ohlc_zip()
     if archive is None:
         return None
@@ -145,17 +202,20 @@ def load_sensex_ohlc_zip_spot_series(trade_date: date) -> SpotSeries | None:
     if frame.empty:
         return None
 
-    frame["close"] = pd.to_numeric(frame["Close"], errors="coerce")
-    frame = frame.dropna(subset=["close"])
+    for source, target in (
+        ("Open", "open"),
+        ("High", "high"),
+        ("Low", "low"),
+        ("Close", "close"),
+    ):
+        frame[target] = pd.to_numeric(frame[source], errors="coerce")
+    frame = frame.dropna(subset=["open", "high", "low", "close"])
     frame["timestamp"] = frame["timestamp"].dt.tz_localize(IST).dt.floor("min")
     frame = frame.sort_values("timestamp").drop_duplicates("timestamp", keep="last")
-    points = [
-        (row.timestamp.to_pydatetime(), float(row.close))
-        for row in frame[["timestamp", "close"]].itertuples(index=False)
-    ]
-    if not points:
+    frame = frame[["timestamp", "open", "high", "low", "close"]]
+    if frame.empty:
         return None
-    return SpotSeries("SENSEX", trade_date, archive, points)
+    return SpotOhlcSeries("SENSEX", trade_date, archive, frame)
 
 
 def find_sensex_ohlc_zip() -> Path | None:

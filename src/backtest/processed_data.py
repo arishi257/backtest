@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 
 from fit_sensex.models import AnalyticsResult
+from backtest.headless_portfolio import ParkGammaMetrics
 from vol_dashboard.models import ExpirySession
 
 
@@ -41,7 +42,22 @@ PROCESSED_COLUMNS = [
     "param_capL",
     "param_floorR",
     "portfolio_total_pnl",
+    "portfolio_gamma_l",
     "portfolio_gamma_diff_total",
+    "future_prev_close",
+    "future_open",
+    "future_high",
+    "future_low",
+    "future_close",
+    "park_move",
+    "park_gamma_pnl",
+    "park_c2c_gamma_pnl",
+    "park_gamma_pnl_diff",
+    "park_gamma_pnl_diff_total",
+    "gk_move",
+    "gk_gamma_pnl",
+    "gk_gamma_pnl_diff",
+    "gk_gamma_pnl_diff_total",
     "frozen_iv_total_pnl",
 ]
 
@@ -75,8 +91,10 @@ class ProcessedDataWriter:
         spot_points: list[tuple[datetime, float]],
         universal_mid_points: list[tuple[datetime, float]],
         portfolio_total_pnl: float | None = None,
+        portfolio_gamma_l: float | None = None,
         portfolio_gamma_diff_total: float | None = None,
         frozen_iv_total_pnl: float | None = None,
+        park_gamma_metrics: ParkGammaMetrics | None = None,
     ) -> None:
         if result is None:
             return
@@ -105,8 +123,10 @@ class ProcessedDataWriter:
                     spot_points,
                     universal_mid_points,
                     portfolio_total_pnl,
+                    portfolio_gamma_l,
                     portfolio_gamma_diff_total,
                     frozen_iv_total_pnl,
+                    park_gamma_metrics,
                 )
             )
         self.last_written_minute.add(write_key)
@@ -130,8 +150,10 @@ def processed_row(
     spot_points: list[tuple[datetime, float]],
     universal_mid_points: list[tuple[datetime, float]],
     portfolio_total_pnl: float | None,
+    portfolio_gamma_l: float | None,
     portfolio_gamma_diff_total: float | None,
     frozen_iv_total_pnl: float | None,
+    park_gamma_metrics: ParkGammaMetrics | None = None,
 ) -> dict[str, object]:
     a_fit, bl_fit, br_fit, capl_fit, floorr_fit = result.fitted_params
     elapsed_spot = elapsed_points(spot_points, timestamp)
@@ -184,7 +206,50 @@ def processed_row(
         "param_capL": capl_fit,
         "param_floorR": floorr_fit,
         "portfolio_total_pnl": blank_if_none(portfolio_total_pnl),
+        "portfolio_gamma_l": blank_if_none(portfolio_gamma_l),
         "portfolio_gamma_diff_total": blank_if_none(portfolio_gamma_diff_total),
+        "future_prev_close": blank_if_none(
+            park_gamma_metrics.future_prev_close if park_gamma_metrics else None
+        ),
+        "future_open": blank_if_none(
+            park_gamma_metrics.future_open if park_gamma_metrics else None
+        ),
+        "future_high": blank_if_none(
+            park_gamma_metrics.future_high if park_gamma_metrics else None
+        ),
+        "future_low": blank_if_none(
+            park_gamma_metrics.future_low if park_gamma_metrics else None
+        ),
+        "future_close": blank_if_none(
+            park_gamma_metrics.future_close if park_gamma_metrics else None
+        ),
+        "park_move": blank_if_none(
+            park_gamma_metrics.park_move if park_gamma_metrics else None
+        ),
+        "park_gamma_pnl": blank_if_none(
+            park_gamma_metrics.park_gamma_pnl if park_gamma_metrics else None
+        ),
+        "park_c2c_gamma_pnl": blank_if_none(
+            park_gamma_metrics.park_c2c_gamma_pnl if park_gamma_metrics else None
+        ),
+        "park_gamma_pnl_diff": blank_if_none(
+            park_gamma_metrics.park_gamma_pnl_diff if park_gamma_metrics else None
+        ),
+        "park_gamma_pnl_diff_total": blank_if_none(
+            park_gamma_metrics.park_gamma_pnl_diff_total if park_gamma_metrics else None
+        ),
+        "gk_move": blank_if_none(
+            park_gamma_metrics.gk_move if park_gamma_metrics else None
+        ),
+        "gk_gamma_pnl": blank_if_none(
+            park_gamma_metrics.gk_gamma_pnl if park_gamma_metrics else None
+        ),
+        "gk_gamma_pnl_diff": blank_if_none(
+            park_gamma_metrics.gk_gamma_pnl_diff if park_gamma_metrics else None
+        ),
+        "gk_gamma_pnl_diff_total": blank_if_none(
+            park_gamma_metrics.gk_gamma_pnl_diff_total if park_gamma_metrics else None
+        ),
         "frozen_iv_total_pnl": blank_if_none(frozen_iv_total_pnl),
     }
     for result_row in result.rows:

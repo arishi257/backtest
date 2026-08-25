@@ -14,6 +14,7 @@ from backtest.config import (
 from backtest.data import load_option_dataset
 from backtest.headless_portfolio import (
     GammaDiffTracker,
+    ParkGammaTracker,
     HeadlessFrozenIvState,
     HeadlessPortfolioState,
 )
@@ -64,6 +65,9 @@ def main() -> None:
 
     csv_path = resolve_sample_csv(args.date, args.csv, args.underlying)
     dataset = load_option_dataset(csv_path, args.underlying)
+    future_series = dataset.future_series
+    if future_series is None:
+        print("Nearest futures data unavailable.")
     spot_points = []
     try:
         spot_points = load_spot_series(dataset.trade_date, dataset.underlying).points
@@ -91,6 +95,10 @@ def main() -> None:
         for session in sessions
     }
     gamma_trackers = {session.spec.tab_name: GammaDiffTracker() for session in sessions}
+    park_gamma_trackers = {
+        session.spec.tab_name: ParkGammaTracker() for session in sessions
+    }
+    final_metrics: dict[str, dict[str, float | None]] = {}
 
     cycles = 0
     analytics = 0
@@ -123,6 +131,19 @@ def main() -> None:
                 result.universal_mid,
                 portfolio_metrics.gamma_l,
             )
+            future_bar = future_series.bar_at(replay.now()) if future_series else None
+            park_gamma_metrics = park_gamma_trackers[tab_name].update(
+                future_bar,
+                portfolio_metrics.gamma_l,
+            )
+            final_metrics[tab_name] = {
+                "portfolio_total_pnl": portfolio_metrics.total_pnl,
+                "portfolio_gamma_l": portfolio_metrics.gamma_l,
+                "portfolio_gamma_diff_total": gamma_diff_total,
+                "park_gamma_pnl_diff_total": park_gamma_metrics.park_gamma_pnl_diff_total,
+                "gk_gamma_pnl_diff_total": park_gamma_metrics.gk_gamma_pnl_diff_total,
+                "frozen_iv_total_pnl": frozen_metrics.total_pnl,
+            }
             processed_writer.write(
                 replay.now(),
                 session,
@@ -130,8 +151,10 @@ def main() -> None:
                 spot_points,
                 universal_mid_points[tab_name],
                 portfolio_metrics.total_pnl,
+                portfolio_metrics.gamma_l,
                 gamma_diff_total,
                 frozen_metrics.total_pnl,
+                park_gamma_metrics,
             )
 
     print(
@@ -141,6 +164,18 @@ def main() -> None:
         f"Replay refresh: {min(session.config.market.refresh_ms for session in sessions)} ms. "
         f"Source CSV: {csv_path}"
     )
+    if final_metrics:
+        print("Final running PnL metrics:")
+        for tab_name, metrics in final_metrics.items():
+            print(f"  {tab_name}:")
+            for name, value in metrics.items():
+                print(f"    {name}: {format_final_metric(value)}")
+
+
+def format_final_metric(value: float | None) -> str:
+    if value is None:
+        return "--"
+    return f"{value:.0f}"
 
 
 if __name__ == "__main__":

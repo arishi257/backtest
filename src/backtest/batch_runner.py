@@ -3,8 +3,13 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+import math
 from pathlib import Path
 
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.table import Table, TableStyleInfo
 import pandas as pd
 
 from backtest.config import (
@@ -19,8 +24,10 @@ from backtest.data import load_option_dataset
 from backtest.data import parse_expiry_text, ticker_pattern
 from backtest.headless_portfolio import (
     GammaDiffTracker,
+    ParkGammaTracker,
     HeadlessFrozenIvState,
     HeadlessPortfolioState,
+    is_top_move_time,
 )
 from backtest.processed_data import ProcessedDataWriter
 from backtest.replay import CsvReplayFeed, register_token_tickers
@@ -34,6 +41,87 @@ class BatchResult:
     underlying: str
     status: str
     detail: str
+    portfolio_total_pnl: float | None = None
+    portfolio_gamma_diff_total: float | None = None
+    park_gamma_pnl_diff_total: float | None = None
+    gk_gamma_pnl_diff_total: float | None = None
+    frozen_iv_total_pnl: float | None = None
+    close_to_close_vol: float | None = None
+    park_vol: float | None = None
+    gk_vol: float | None = None
+
+
+@dataclass
+class VolMetrics:
+    close_to_close_vol: float | None = None
+    park_vol: float | None = None
+    gk_vol: float | None = None
+
+
+class OhlcVolTracker:
+    def __init__(self) -> None:
+        self.previous_bar = None
+        self.close_to_close_variance = 0.0
+        self.park_variance = 0.0
+        self.gk_variance = 0.0
+        self.has_values = False
+        self.calendar_days: float | None = None
+        self.intraday_var: float | None = None
+
+    def update(
+        self,
+        timestamp: datetime,
+        bar,
+        calendar_days: float,
+        intraday_var: float,
+    ) -> None:
+        self.calendar_days = calendar_days
+        self.intraday_var = intraday_var
+        if bar is None:
+            return
+        if self.previous_bar is None:
+            self.previous_bar = bar
+            return
+        if is_top_move_time(timestamp):
+            self.close_to_close_variance += close_to_close_variance(
+                self.previous_bar.close,
+                bar.close,
+            )
+            self.park_variance += parkinson_variance(bar.high, bar.low)
+            self.gk_variance += garman_klass_variance(
+                bar.open,
+                bar.high,
+                bar.low,
+                bar.close,
+            )
+            self.has_values = True
+        self.previous_bar = bar
+
+    def metrics(self) -> VolMetrics:
+        if (
+            not self.has_values
+            or self.calendar_days is None
+            or self.intraday_var is None
+            or self.intraday_var <= 0
+        ):
+            return VolMetrics()
+        return VolMetrics(
+            close_to_close_vol=scaled_volatility(
+                self.close_to_close_variance,
+                self.calendar_days,
+                self.intraday_var,
+            ),
+            park_vol=scaled_volatility(
+                self.park_variance,
+                self.calendar_days,
+                self.intraday_var,
+            ),
+            gk_vol=scaled_volatility(
+                self.gk_variance,
+                self.calendar_days,
+                self.intraday_var,
+            ),
+        )
 
 
 def main() -> None:
@@ -62,6 +150,18 @@ def main() -> None:
         help="BS delta lots threshold for re-hedging.",
     )
     parser.add_argument(
+        "--refresh-ms",
+        type=positive_int,
+        default=None,
+        help="Milliseconds between replay slices, e.g. 20.",
+    )
+    parser.add_argument(
+        "--excel-output",
+        type=Path,
+        default=None,
+        help="Optional .xlsx path for OK 0DTE batch results only.",
+    )
+    parser.add_argument(
         "--all-dates",
         action="store_true",
         help="Run every requested date instead of only 0DTE expiry dates.",
@@ -80,6 +180,7 @@ def main() -> None:
                 args.workbook,
                 args.processed_output_dir,
                 args.hedge_threshold,
+                args.refresh_ms,
                 expiry_only=not args.all_dates,
             )
             results.append(result)
@@ -88,6 +189,10 @@ def main() -> None:
     ok = sum(1 for result in results if result.status == "OK")
     skipped = len(results) - ok
     print(f"Batch complete. OK: {ok}. Skipped/failed: {skipped}.")
+    print_results_table(results)
+    if args.excel_output is not None:
+        write_results_excel(results, args.excel_output)
+        print(f"Excel output: {args.excel_output}")
 
 
 def run_one(
@@ -96,6 +201,7 @@ def run_one(
     workbook: Path,
     processed_output_dir: Path,
     hedge_threshold: float,
+    refresh_ms: int | None,
     expiry_only: bool = True,
 ) -> BatchResult:
     try:
@@ -107,6 +213,9 @@ def run_one(
         dataset = load_option_dataset(csv_path, underlying)
     except Exception as exc:
         return BatchResult(date_key, underlying, "SKIP", str(exc))
+    future_series = dataset.future_series
+    if future_series is None:
+        print("  Nearest futures data unavailable.")
 
     spot_points = []
     try:
@@ -116,7 +225,7 @@ def run_one(
 
     current_time = lambda: replay.now()
     try:
-        sessions = build_backtest_sessions(dataset, workbook, current_time)
+        sessions = build_backtest_sessions(dataset, workbook, current_time, refresh_ms=refresh_ms)
     except Exception as exc:
         return BatchResult(date_key, underlying, "SKIP", str(exc))
 
@@ -133,6 +242,11 @@ def run_one(
         for session in sessions
     }
     gamma_trackers = {session.spec.tab_name: GammaDiffTracker() for session in sessions}
+    park_gamma_trackers = {
+        session.spec.tab_name: ParkGammaTracker() for session in sessions
+    }
+    vol_trackers = {session.spec.tab_name: OhlcVolTracker() for session in sessions}
+    final_metrics: dict[str, float | None] = {}
 
     cycles = 0
     analytics = 0
@@ -166,6 +280,27 @@ def run_one(
                     result.universal_mid,
                     portfolio_metrics.gamma_l,
                 )
+                park_gamma_metrics = park_gamma_trackers[tab_name].update(
+                    future_series.bar_at(timestamp) if future_series else None,
+                    portfolio_metrics.gamma_l,
+                )
+                vol_trackers[tab_name].update(
+                    timestamp,
+                    future_series.bar_at(timestamp) if future_series else None,
+                    session.config.market.calendar_days,
+                    result.intraday_var,
+                )
+                vol_metrics = vol_trackers[tab_name].metrics()
+                final_metrics = {
+                    "portfolio_total_pnl": portfolio_metrics.total_pnl,
+                    "portfolio_gamma_diff_total": gamma_diff_total,
+                    "park_gamma_pnl_diff_total": park_gamma_metrics.park_gamma_pnl_diff_total,
+                    "gk_gamma_pnl_diff_total": park_gamma_metrics.gk_gamma_pnl_diff_total,
+                    "frozen_iv_total_pnl": frozen_metrics.total_pnl,
+                    "close_to_close_vol": vol_metrics.close_to_close_vol,
+                    "park_vol": vol_metrics.park_vol,
+                    "gk_vol": vol_metrics.gk_vol,
+                }
                 processed_writer.write(
                     timestamp,
                     session,
@@ -173,8 +308,10 @@ def run_one(
                     spot_points,
                     universal_mid_points[tab_name],
                     portfolio_metrics.total_pnl,
+                    portfolio_metrics.gamma_l,
                     gamma_diff_total,
                     frozen_metrics.total_pnl,
+                    park_gamma_metrics,
                 )
     except Exception as exc:
         return BatchResult(date_key, underlying, "FAIL", str(exc))
@@ -184,7 +321,169 @@ def run_one(
         underlying,
         "OK",
         f"{cycles} cycles, {analytics} analytics rows",
+        portfolio_total_pnl=final_metrics.get("portfolio_total_pnl"),
+        portfolio_gamma_diff_total=final_metrics.get("portfolio_gamma_diff_total"),
+        park_gamma_pnl_diff_total=final_metrics.get("park_gamma_pnl_diff_total"),
+        gk_gamma_pnl_diff_total=final_metrics.get("gk_gamma_pnl_diff_total"),
+        frozen_iv_total_pnl=final_metrics.get("frozen_iv_total_pnl"),
+        close_to_close_vol=final_metrics.get("close_to_close_vol"),
+        park_vol=final_metrics.get("park_vol"),
+        gk_vol=final_metrics.get("gk_vol"),
     )
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be greater than zero.")
+    return parsed
+
+
+def print_results_table(results: list[BatchResult]) -> None:
+    columns = result_columns(include_detail=True)
+    rows = [
+        [format_table_value(attr, getattr(result, attr)) for attr, _ in columns]
+        for result in results
+    ]
+    widths = [
+        max(len(header), *(len(row[index]) for row in rows))
+        for index, (_, header) in enumerate(columns)
+    ]
+    header = " | ".join(
+        label.ljust(widths[index])
+        for index, (_, label) in enumerate(columns)
+    )
+    separator = "-+-".join("-" * width for width in widths)
+    print(header)
+    print(separator)
+    for row in rows:
+        print(" | ".join(value.ljust(widths[index]) for index, value in enumerate(row)))
+
+
+def result_columns(include_detail: bool) -> list[tuple[str, str]]:
+    columns = [
+        ("date_key", "date"),
+        ("underlying", "underlying"),
+        ("status", "status"),
+        ("portfolio_total_pnl", "portfolio_total_pnl"),
+        ("portfolio_gamma_diff_total", "portfolio_gamma_diff_total"),
+        ("park_gamma_pnl_diff_total", "park_gamma_pnl_diff_total"),
+        ("gk_gamma_pnl_diff_total", "gk_gamma_pnl_diff_total"),
+        ("frozen_iv_total_pnl", "frozen_iv_total_pnl"),
+        ("close_to_close_vol", "close_to_close_vol"),
+        ("park_vol", "park_vol"),
+        ("gk_vol", "gk_vol"),
+    ]
+    if include_detail:
+        columns.append(("detail", "detail"))
+    return columns
+
+
+def write_results_excel(results: list[BatchResult], output_path: Path) -> None:
+    ok_results = [result for result in results if result.status == "OK"]
+    columns = result_columns(include_detail=False)
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "0DTE Results"
+    headers = [label for _, label in columns]
+    sheet.append(headers)
+    for result in ok_results:
+        sheet.append([excel_value(attr, getattr(result, attr)) for attr, _ in columns])
+
+    header_fill = PatternFill("solid", fgColor="1F4E78")
+    header_font = Font(color="FFFFFF", bold=True)
+    for cell in sheet[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center")
+    sheet.freeze_panes = "A2"
+
+    if ok_results:
+        table = Table(displayName="Sensex0DteResults", ref=sheet.dimensions)
+        table.tableStyleInfo = TableStyleInfo(
+            name="TableStyleMedium2",
+            showFirstColumn=False,
+            showLastColumn=False,
+            showRowStripes=True,
+            showColumnStripes=False,
+        )
+        sheet.add_table(table)
+
+    vol_fields = {"close_to_close_vol", "park_vol", "gk_vol"}
+    pnl_fields = {
+        "portfolio_total_pnl",
+        "portfolio_gamma_diff_total",
+        "park_gamma_pnl_diff_total",
+        "gk_gamma_pnl_diff_total",
+        "frozen_iv_total_pnl",
+    }
+    for column_index, (attr, _) in enumerate(columns, start=1):
+        letter = get_column_letter(column_index)
+        for row_index in range(2, sheet.max_row + 1):
+            cell = sheet[f"{letter}{row_index}"]
+            if attr in vol_fields:
+                cell.number_format = "0.00%"
+            elif attr in pnl_fields:
+                cell.number_format = "#,##0"
+
+    for column in sheet.columns:
+        letter = get_column_letter(column[0].column)
+        max_length = max(len(str(cell.value)) if cell.value is not None else 0 for cell in column)
+        sheet.column_dimensions[letter].width = min(max(max_length + 2, 11), 28)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    workbook.save(output_path)
+
+
+def excel_value(attr: str, value: object) -> object:
+    if value is None:
+        return None
+    if attr == "date_key":
+        return datetime.strptime(str(value), "%d%m%Y").date()
+    return value
+
+
+def format_table_value(attr: str, value: object) -> str:
+    if value is None:
+        return "--"
+    if isinstance(value, float):
+        if attr in {"close_to_close_vol", "park_vol", "gk_vol"}:
+            return f"{value:.2%}"
+        return f"{value:.0f}"
+    return str(value)
+
+
+def close_to_close_variance(previous_close: float, close: float) -> float:
+    if previous_close <= 0 or close <= 0:
+        return 0.0
+    return math.log(close / previous_close) ** 2
+
+
+def parkinson_variance(high: float, low: float) -> float:
+    if high <= 0 or low <= 0:
+        return 0.0
+    return math.log(high / low) ** 2 / (4 * math.log(2))
+
+
+def garman_klass_variance(
+    open_price: float,
+    high: float,
+    low: float,
+    close: float,
+) -> float:
+    if open_price <= 0 or high <= 0 or low <= 0 or close <= 0:
+        return 0.0
+    range_term = 0.5 * math.log(high / low) ** 2
+    close_open_term = (2 * math.log(2) - 1) * math.log(close / open_price) ** 2
+    return max(range_term - close_open_term, 0.0)
+
+
+def scaled_volatility(
+    variance: float,
+    calendar_days: float,
+    intraday_var: float,
+) -> float:
+    return math.sqrt(variance / intraday_var * calendar_days)
 
 
 def requested_dates(args: argparse.Namespace) -> list[str]:

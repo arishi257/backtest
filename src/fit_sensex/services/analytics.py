@@ -101,7 +101,7 @@ class AnalyticsEngine:
         if ist_curr.tzinfo is None:
             ist_curr = ist_curr.replace(tzinfo=ZoneInfo("Asia/Kolkata"))
         start_time = ist_curr.replace(hour=9, minute=15, second=0, microsecond=0)
-        end_time = ist_curr.replace(hour=15, minute=25, second=0, microsecond=0)
+        end_time = ist_curr.replace(hour=15, minute=40, second=0, microsecond=0)
         total_session_seconds = (end_time - start_time).total_seconds()
         remaining_seconds = (end_time - ist_curr).total_seconds()
         return max(0.0, min(1.0, remaining_seconds / total_session_seconds))

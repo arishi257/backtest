@@ -4,6 +4,7 @@ import math
 from dataclasses import dataclass
 from datetime import datetime
 
+from backtest.data import FutureBar
 from backtest.portfolio import SamplePortfolioRisk, build_sample_portfolio
 from fit_sensex.models import AnalyticsResult
 from fit_sensex.pricing.black_scholes import (
@@ -24,10 +25,31 @@ from fit_sensex.ui.app import total_row_numeric_values, weighted_price_total
 from vol_dashboard.models import ExpirySession
 
 
+GAMMA_MOVE_STEP = 0.001
+
+
 @dataclass
 class HeadlessPortfolioMetrics:
     total_pnl: float | None = None
     gamma_l: float | None = None
+
+
+@dataclass
+class ParkGammaMetrics:
+    future_open: float | None = None
+    future_high: float | None = None
+    future_low: float | None = None
+    future_close: float | None = None
+    future_prev_close: float | None = None
+    park_move: float | None = None
+    park_gamma_pnl: float | None = None
+    park_c2c_gamma_pnl: float | None = None
+    park_gamma_pnl_diff: float | None = None
+    park_gamma_pnl_diff_total: float | None = None
+    gk_move: float | None = None
+    gk_gamma_pnl: float | None = None
+    gk_gamma_pnl_diff: float | None = None
+    gk_gamma_pnl_diff_total: float | None = None
 
 
 class HeadlessPortfolioState:
@@ -305,7 +327,7 @@ class GammaDiffTracker:
             if not is_top_move_time(timestamp) or previous_mid == 0:
                 continue
             move_return = mid / previous_mid - 1
-            if abs(move_return) <= 0.001:
+            if abs(move_return) <= GAMMA_MOVE_STEP:
                 continue
             gamma_l = gamma_by_timestamp.get(previous_time)
             if gamma_l is None:
@@ -314,6 +336,78 @@ class GammaDiffTracker:
             capped_gamma_pnl = capped_gamma_pnl_for_move(gamma_l, move_return)
             rows.append(capped_gamma_pnl - gamma_pnl)
         return sum(rows) if rows else None
+
+
+class ParkGammaTracker:
+    def __init__(self) -> None:
+        self.previous_bar: FutureBar | None = None
+        self.previous_gamma_l: float | None = None
+        self.park_gamma_pnl_diff_total = 0.0
+        self.gk_gamma_pnl_diff_total = 0.0
+        self.has_values = False
+
+    def update(
+        self,
+        bar: FutureBar | None,
+        gamma_l: float | None,
+    ) -> ParkGammaMetrics:
+        if bar is None:
+            return ParkGammaMetrics(
+                park_gamma_pnl_diff_total=(
+                    self.park_gamma_pnl_diff_total if self.has_values else None
+                ),
+                gk_gamma_pnl_diff_total=(
+                    self.gk_gamma_pnl_diff_total if self.has_values else None
+                ),
+            )
+
+        metrics = ParkGammaMetrics(
+            future_open=bar.open,
+            future_high=bar.high,
+            future_low=bar.low,
+            future_close=bar.close,
+            park_gamma_pnl_diff_total=(
+                self.park_gamma_pnl_diff_total if self.has_values else None
+            ),
+            gk_gamma_pnl_diff_total=(
+                self.gk_gamma_pnl_diff_total if self.has_values else None
+            ),
+        )
+        if (
+            self.previous_bar is None
+            or self.previous_gamma_l is None
+            or self.previous_bar.close <= 0
+            or bar.close <= 0
+        ):
+            self.previous_bar = bar
+            self.previous_gamma_l = gamma_l
+            return metrics
+
+        previous_close = self.previous_bar.close
+        metrics.future_prev_close = previous_close
+        close_return = bar.close / previous_close - 1
+        park_move = parkinson_move(bar.high, bar.low)
+        park_gamma_pnl = gamma_pnl_for_move(self.previous_gamma_l, park_move)
+        park_c2c_gamma_pnl = gamma_pnl_for_move(self.previous_gamma_l, close_return)
+        park_gamma_pnl_diff = park_gamma_pnl - park_c2c_gamma_pnl
+        gk_move_value = garman_klass_move(bar.open, bar.high, bar.low, bar.close)
+        gk_gamma_pnl = gamma_pnl_for_move(self.previous_gamma_l, gk_move_value)
+        gk_gamma_pnl_diff = gk_gamma_pnl - park_c2c_gamma_pnl
+        self.park_gamma_pnl_diff_total += park_gamma_pnl_diff
+        self.gk_gamma_pnl_diff_total += gk_gamma_pnl_diff
+        self.has_values = True
+        metrics.park_move = park_move
+        metrics.park_gamma_pnl = park_gamma_pnl
+        metrics.park_c2c_gamma_pnl = park_c2c_gamma_pnl
+        metrics.park_gamma_pnl_diff = park_gamma_pnl_diff
+        metrics.park_gamma_pnl_diff_total = self.park_gamma_pnl_diff_total
+        metrics.gk_move = gk_move_value
+        metrics.gk_gamma_pnl = gk_gamma_pnl
+        metrics.gk_gamma_pnl_diff = gk_gamma_pnl_diff
+        metrics.gk_gamma_pnl_diff_total = self.gk_gamma_pnl_diff_total
+        self.previous_bar = bar
+        self.previous_gamma_l = gamma_l
+        return metrics
 
 
 def record_metric_point(
@@ -494,10 +588,25 @@ def gamma_pnl_for_move(gamma_l: float, move_return: float) -> float:
     return 0.5 * (gamma_l * 100000 * 10) * move_return * move_return * 100 / 1000
 
 
+def parkinson_move(high: float, low: float) -> float:
+    if high <= 0 or low <= 0:
+        return 0.0
+    return abs(math.log(high / low)) / math.sqrt(4 * math.log(2))
+
+
+def garman_klass_move(open_price: float, high: float, low: float, close: float) -> float:
+    if open_price <= 0 or high <= 0 or low <= 0 or close <= 0:
+        return 0.0
+    range_term = 0.5 * math.log(high / low) ** 2
+    close_open_term = (2 * math.log(2) - 1) * math.log(close / open_price) ** 2
+    variance = max(range_term - close_open_term, 0.0)
+    return math.sqrt(variance)
+
+
 def capped_gamma_pnl_for_move(gamma_l: float, move_return: float) -> float:
     remaining_move = abs(move_return)
     capped_pnl = 0.0
-    max_chunk = 0.001
+    max_chunk = GAMMA_MOVE_STEP
     while remaining_move > 0:
         chunk = min(max_chunk, remaining_move)
         capped_pnl += gamma_pnl_for_move(gamma_l, chunk)

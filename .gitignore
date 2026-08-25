@@ -2,3 +2,17 @@
 processed_data/
 __pycache__/
 *.py[cod]
+*.egg-info/
+node_modules/
+outputs/
+runs_1s/
+runs_1m/
+snapshots/
+backtest_snapshots/
+best_synth_sims/
+10am_restrike_anurag/
+10am_restrike_anurag_spot/
+.codex_doc_review/
+1dte/outputs/
+1dte/runs_1s/
+1dte/runs_1m/
